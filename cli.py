@@ -5,11 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import tempfile
 from pathlib import Path
 
 from wav2chat import __version__
-from wav2chat.audio import normalize_audio
 from wav2chat.errors import (
     EmptyBatchDirectoryError,
     InputNotFoundError,
@@ -18,9 +16,14 @@ from wav2chat.errors import (
     Wav2ChatError,
 )
 from wav2chat.funasr_backend import FunASRBackend
-from wav2chat.render import render_json, render_txt
-
-SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".amr", ".aac", ".flac", ".ogg"}
+from wav2chat.i18n import set_locale
+from wav2chat.pipeline import (
+    SUPPORTED_EXTENSIONS,
+    convert_file,
+    default_txt_path,
+    is_supported_audio,
+    write_transcript_outputs,
+)
 
 
 def _parse_roles(values: list[str] | None) -> dict[str, str]:
@@ -43,15 +46,11 @@ def _parse_roles(values: list[str] | None) -> dict[str, str]:
     return roles
 
 
-def _is_supported_audio(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-
-
 def _collect_batch_files(directory: Path) -> list[Path]:
     files = sorted(
         path
         for path in directory.iterdir()
-        if _is_supported_audio(path)
+        if is_supported_audio(path)
     )
     if not files:
         raise EmptyBatchDirectoryError(
@@ -84,14 +83,6 @@ def _resolve_output_paths(
     return txt_path, json_path
 
 
-def _default_txt_path(input_path: Path) -> Path:
-    return input_path.with_suffix(".txt")
-
-
-def _default_json_path(input_path: Path) -> Path:
-    return input_path.with_suffix(".json")
-
-
 def _create_backend(args: argparse.Namespace) -> FunASRBackend:
     if args.backend != "funasr":
         raise UnsupportedBackendError(
@@ -105,6 +96,16 @@ def _create_backend(args: argparse.Namespace) -> FunASRBackend:
     )
 
 
+def _configure_logging(verbose: bool, quiet: bool) -> None:
+    if quiet and not verbose:
+        level = logging.ERROR
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
+
 def _process_file(
     input_path: Path,
     backend: FunASRBackend,
@@ -113,49 +114,25 @@ def _process_file(
     json_path: Path | None,
     keep_temp: bool,
     verbose: bool,
+    quiet: bool,
 ) -> None:
     input_path = input_path.resolve()
-    if not input_path.is_file():
-        raise InputNotFoundError(f"Input file not found: {input_path}")
-    if not _is_supported_audio(input_path):
-        raise UnsupportedInputError(
-            f"Unsupported input type: {input_path.suffix or '(no extension)'}. "
-            f"Supported extensions: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
-        )
-
     if txt_path is None and json_path is None:
-        txt_path = _default_txt_path(input_path)
+        txt_path = default_txt_path(input_path)
 
-    temp_ctx = tempfile.TemporaryDirectory(prefix="wav2chat_")
-    temp_dir = Path(temp_ctx.name)
-    normalized_path: Path | None = None
-
-    try:
-        normalized_path = normalize_audio(input_path, temp_dir)
-        if verbose:
-            logging.info("Normalized audio: %s", normalized_path)
-
-        transcript = backend.transcribe(
-            wav_path=normalized_path,
-            source_name=input_path.name,
-            roles=roles,
-        )
-
-        if txt_path is not None:
-            txt_path.write_text(render_txt(transcript), encoding="utf-8")
-            print(f"Wrote {txt_path}")
-
-        if json_path is not None:
-            json_path.write_text(render_json(transcript), encoding="utf-8")
-            print(f"Wrote {json_path}")
-    finally:
-        if keep_temp and normalized_path is not None and normalized_path.exists():
-            kept_path = input_path.with_name(f"{input_path.stem}_normalized.wav")
-            kept_path.write_bytes(normalized_path.read_bytes())
-            print(f"Kept normalized wav: {kept_path}")
-            temp_ctx.cleanup()
-        elif not keep_temp:
-            temp_ctx.cleanup()
+    transcript = convert_file(
+        input_path=input_path,
+        backend=backend,
+        roles=roles,
+        keep_temp=keep_temp,
+        verbose=verbose,
+    )
+    write_transcript_outputs(
+        transcript,
+        txt_path=txt_path,
+        json_path=json_path,
+        quiet=quiet,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -163,7 +140,12 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="wav2chat",
         description="Convert audio recordings into speaker-segmented chat transcripts.",
     )
-    parser.add_argument("input", type=Path, help="Input audio file or directory")
+    parser.add_argument(
+        "input",
+        type=Path,
+        nargs="?",
+        help="Input audio file or directory",
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -177,33 +159,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output .json file, or output directory in batch mode",
     )
     parser.add_argument(
+        "-b",
         "--batch",
         action="store_true",
         help="Process all supported audio files in a directory",
     )
     parser.add_argument(
+        "-e",
         "--backend",
         default="funasr",
         help="Transcription backend (default: funasr)",
     )
     parser.add_argument(
+        "-l",
         "--lang",
         default="zh",
         help="Language hint (default: zh)",
     )
     parser.add_argument(
+        "-n",
         "--min-speakers",
         type=int,
         default=None,
         help="Minimum number of speakers for diarization",
     )
     parser.add_argument(
+        "-m",
         "--max-speakers",
         type=int,
         default=None,
         help="Maximum number of speakers for diarization",
     )
     parser.add_argument(
+        "-r",
         "--role",
         action="append",
         default=[],
@@ -211,14 +199,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Map speaker id to display name, e.g. --role spk0=我",
     )
     parser.add_argument(
+        "-k",
         "--keep-temp",
         action="store_true",
         help="Keep the normalized intermediate WAV file",
     )
     parser.add_argument(
+        "-v",
         "--verbose",
         action="store_true",
         help="Print debug information",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress non-error output",
+    )
+    parser.add_argument(
+        "-g",
+        "--gui",
+        action="store_true",
+        help="Open the desktop GUI",
+    )
+    parser.add_argument(
+        "--ui-lang",
+        choices=["en", "zh", "ja", "ko"],
+        default=None,
+        help="UI language (default: auto from LANG/LC_MESSAGES)",
     )
     parser.add_argument(
         "--version",
@@ -232,13 +240,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
+    _configure_logging(args.verbose, args.quiet)
+    set_locale(args.ui_lang)
 
     try:
         roles = _parse_roles(args.role)
+        args._roles = roles  # used by GUI
+
+        if args.gui:
+            from wav2chat.gui import run_gui
+
+            return run_gui(args)
+
+        if args.input is None:
+            raise UnsupportedInputError("Input path is required unless --gui is used.")
+
         backend = _create_backend(args)
         input_path = args.input.resolve()
 
@@ -261,9 +277,7 @@ def main(argv: list[str] | None = None) -> int:
 
             for file_path in files:
                 txt_path = txt_dir / f"{file_path.stem}.txt"
-                json_path = (
-                    json_dir / f"{file_path.stem}.json" if json_dir is not None else None
-                )
+                json_path = json_dir / f"{file_path.stem}.json" if json_dir is not None else None
                 try:
                     _process_file(
                         input_path=file_path,
@@ -273,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
                         json_path=json_path,
                         keep_temp=args.keep_temp,
                         verbose=args.verbose,
+                        quiet=args.quiet,
                     )
                 except Wav2ChatError as exc:
                     failures.append(f"{file_path.name}: {exc}")
@@ -307,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
             json_path=json_path,
             keep_temp=args.keep_temp,
             verbose=args.verbose,
+            quiet=args.quiet,
         )
         return 0
 
