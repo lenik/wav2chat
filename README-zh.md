@@ -97,14 +97,25 @@ wav2chat call.m4a --keep-temp --verbose
 
 ## GUI
 
-启动桌面界面（需要 [wxPython](https://wxpython.org/)）：
+GUI 使用系统自带的 **wxPython**（Linux 上 pip 没有预编译包）。
+
+Debian / Ubuntu：
 
 ```bash
-pip install -e ".[gui]"
-wav2chat --gui
+sudo apt install python3-wxgtk4.0
+pip install -e .
 ```
 
-Debian/Ubuntu 也可：`sudo apt install python3-wxgtk4.0`
+若使用 virtualenv，需启用系统 site-packages：
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -e .
+wav2chat -g
+```
+
+或直接：`make install-gui`
 
 界面包含：
 

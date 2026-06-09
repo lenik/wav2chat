@@ -97,14 +97,25 @@ wav2chat call.m4a --keep-temp --verbose
 
 ## GUI
 
-Launch the desktop interface (requires [wxPython](https://wxpython.org/)):
+The GUI uses **wxPython** via the system package (there are no Linux pip wheels).
+
+Debian / Ubuntu:
 
 ```bash
-pip install -e ".[gui]"
-wav2chat --gui
+sudo apt install python3-wxgtk4.0
+pip install -e .
 ```
 
-On Debian/Ubuntu you can also use: `sudo apt install python3-wxgtk4.0`
+If you use a virtualenv, it must see system packages:
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -e .
+wav2chat -g
+```
+
+Or use `make install-gui` (installs the apt package and wav2chat).
 
 The GUI provides:
 
