@@ -1,0 +1,142 @@
+.\" Man page for wav2chat
+.TH WAV2CHAT 1 "June 2026" "wav2chat 0.1.0" "User Commands"
+.SH NAME
+wav2chat \- convert audio recordings into speaker-segmented chat transcripts
+.SH SYNOPSIS
+.B wav2chat
+[\fIOPTION\fR]... [\fIINPUT\fR]
+.SH DESCRIPTION
+.B wav2chat
+converts phone recordings, meeting recordings, or other audio files into
+chat-style text segmented by speaker.
+.PP
+Processing pipeline:
+.IP \(bu 3
+normalize input with \fBffmpeg\fR to mono 16 kHz WAV
+.IP \(bu 3
+transcribe with FunASR (paraformer-zh, fsmn-vad, ct-punc, cam++)
+.IP \(bu 3
+write timestamped \fB.txt\fR and/or structured \fB.json\fR output
+.PP
+Supported input formats: \fB.wav\fR, \fB.mp3\fR, \fB.m4a\fR, \fB.amr\fR,
+\fB.aac\fR, \fB.flac\fR, \fB.ogg\fR.
+.PP
+The first release targets Chinese phone and meeting audio.
+When \fB\-g\fR is used, a desktop GUI is opened instead of CLI batch processing.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+.TP
+.BI \-o ", " \-\-output " PATH
+Write transcript text to \fIPATH\fR.
+In batch mode, \fIPATH\fR is an output directory.
+.TP
+.BI \-\-json " " PATH
+Write transcript JSON to \fIPATH\fR.
+In batch mode, \fIPATH\fR is an output directory.
+.TP
+.BR \-b ", " \-\-batch
+Process all supported audio files in a directory.
+.TP
+.BI \-e ", " \-\-backend " NAME
+Transcription backend (default: \fBfunasr\fR).
+.TP
+.BI \-l ", " \-\-lang " CODE
+Language hint (default: \fBzh\fR).
+.TP
+.BI \-n ", " \-\-min\-speakers " N
+Minimum number of speakers for diarization.
+.TP
+.BI \-m ", " \-\-max\-speakers " N
+Maximum number of speakers for diarization.
+.TP
+.BI \-r ", " \-\-role " SPK=NAME
+Map speaker id to display name.
+Option may be repeated, for example \fB\-\-role spk0=Me \-\-role spk1=Other\fR.
+.TP
+.BR \-k ", " \-\-keep\-temp
+Keep the normalized intermediate WAV file next to the input.
+.TP
+.BR \-v ", " \-\-verbose
+Print debug information.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress non-error output.
+.TP
+.BR \-g ", " \-\-gui
+Open the desktop GUI.
+\fIINPUT\fR is optional in GUI mode.
+.TP
+.BI \-\-ui\-lang " " CODE
+UI language: \fBen\fR, \fBzh\fR, \fBja\fR, or \fBko\fR.
+Default: auto-detect from \fBLANG\fR/\fBLC_MESSAGES\fR.
+.TP
+.BR \-\-version
+Show program version and exit.
+.SH EXAMPLES
+Convert one file, writing \fBcall.txt\fR by default:
+.PP
+.EX
+wav2chat call.m4a
+.EE
+.PP
+Write explicit txt and json outputs:
+.PP
+.EX
+wav2chat call.m4a \-o call.txt \-\-json call.json
+.EE
+.PP
+Batch-convert a directory:
+.PP
+.EX
+wav2chat ./calls \-b \-o ./texts \-\-json ./jsons
+.EE
+.PP
+Two-party phone call with speaker labels:
+.PP
+.EX
+wav2chat call.wav \-n 2 \-m 2 \-r spk0=Me \-r spk1=Other
+.EE
+.PP
+Launch the GUI:
+.PP
+.EX
+wav2chat \-g
+.EE
+.SH FILES
+.TP
+.I *.txt
+Timestamped chat transcript.
+.TP
+.I *.json
+Structured transcript with segments, speakers, and roles.
+.TP
+.I *_normalized.wav
+Intermediate WAV created when \fB\-k\fR is used.
+.SH ENVIRONMENT
+.TP
+.B PATH
+Must include \fBffmpeg\fR for audio normalization.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+User or processing error.
+.TP
+.B 130
+Interrupted (Ctrl-C).
+.SH SEE ALSO
+.BR ffmpeg (1)
+.PP
+Project home: https://github.com/lenik/wav2chat
+.SH BUGS
+Report issues at https://github.com/lenik/wav2chat/issues
+.SH AUTHOR
+Lenik \(la wav2chat@bodz.net \(ra
+.SH COPYRIGHT
+Copyright \(co 2026 Lenik.
+Licensed under the GNU Affero General Public License v3 or later.
+See LICENSE for full terms, including supplemental restrictions.

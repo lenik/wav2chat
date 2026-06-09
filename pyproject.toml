@@ -8,14 +8,14 @@ version = "0.1.0"
 description = "Convert phone/meeting audio into speaker-segmented chat transcripts"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "wav2chat contributors" }]
+license = { file = "LICENSE" }
+authors = [{ name = "Lenik", email = "wav2chat@bodz.net" }]
 keywords = ["asr", "funasr", "speaker-diarization", "transcription"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -29,6 +29,10 @@ dependencies = [
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
 ]
+
+# GUI uses wxPython via the system package on Linux (no pip wheels).
+# Debian/Ubuntu: sudo apt install python3-wxgtk4.0
+# Use a venv with: python3 -m venv --system-site-packages .venv
 
 [project.scripts]
 wav2chat = "wav2chat.cli:main"

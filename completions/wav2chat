@@ -1,0 +1,66 @@
+# bash completion for wav2chat
+# shellcheck disable=SC2207
+
+_wav2chat() {
+    local cur prev words cword
+    _init_completion -s || return
+
+    local opts="
+        -h --help
+        -o --output
+        --json
+        -b --batch
+        -e --backend
+        -l --lang
+        -n --min-speakers
+        -m --max-speakers
+        -r --role
+        -k --keep-temp
+        -v --verbose
+        -q --quiet
+        -g --gui
+        --ui-lang
+        --version
+    "
+
+    case "$prev" in
+        -o|--output|--json)
+            _filedir
+            return
+            ;;
+        -e|--backend)
+            COMPREPLY=( $( compgen -W 'funasr' -- "$cur" ) )
+            return
+            ;;
+        -l|--lang)
+            COMPREPLY=( $( compgen -W 'zh' -- "$cur" ) )
+            return
+            ;;
+        --ui-lang)
+            COMPREPLY=( $( compgen -W 'en zh ja ko' -- "$cur" ) )
+            return
+            ;;
+        -n|--min-speakers|-m|--max-speakers)
+            COMPREPLY=( $( compgen -W '1 2 3 4 5 6 7 8' -- "$cur" ) )
+            return
+            ;;
+        -r|--role)
+            return
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $( compgen -W "$opts" -- "$cur" ) )
+        return
+    fi
+
+    if [[ "$cur" == *=* ]]; then
+        return
+    fi
+
+    local audio_exts='*.wav *.mp3 *.m4a *.amr *.aac *.flac *.ogg'
+    _filedir "$audio_exts"
+    _filedir -d
+}
+
+complete -F _wav2chat wav2chat
