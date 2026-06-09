@@ -31,5 +31,13 @@ def render_txt(transcript: Transcript) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def format_timestamp(seconds: float) -> str:
+    return _format_timestamp(seconds)
+
+
+def display_name(segment) -> str:
+    return _display_name(segment)
+
+
 def render_json(transcript: Transcript) -> str:
     return json.dumps(transcript.to_dict(), ensure_ascii=False, indent=2) + "\n"
