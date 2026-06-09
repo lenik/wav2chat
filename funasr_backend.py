@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
+from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from wav2chat.errors import FunASREmptyResultError, FunASRLoadError
 from wav2chat.models import Segment, Transcript
@@ -15,6 +19,148 @@ DEFAULT_ASR_MODEL = "paraformer-zh"
 DEFAULT_VAD_MODEL = "fsmn-vad"
 DEFAULT_PUNC_MODEL = "ct-punc"
 DEFAULT_SPK_MODEL = "cam++"
+
+
+def _is_local_model_dir(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    return any((path / marker).is_file() for marker in ("model.pt", "config.yaml", "configuration.json"))
+
+
+def _resolve_modelscope_model(model: str) -> str:
+    """Prefer a local ModelScope cache directory over hub aliases."""
+    local = Path(model).expanduser()
+    if _is_local_model_dir(local):
+        return str(local.resolve())
+
+    from funasr.download.name_maps_from_hub import name_maps_ms
+
+    model_id = name_maps_ms.get(model, model)
+    if "/" not in model_id and not model_id.startswith("iic"):
+        return model
+
+    try:
+        from modelscope.utils.file_utils import get_model_cache_root
+    except ImportError:
+        return model
+
+    cache_dir = Path(get_model_cache_root()) / model_id
+    if _is_local_model_dir(cache_dir):
+        logger.debug("Using cached ModelScope model: %s", cache_dir)
+        return str(cache_dir.resolve())
+
+    return model
+
+
+@contextmanager
+def _disable_progress_bars() -> Iterator[None]:
+    """Suppress tqdm progress output from FunASR during GUI conversion."""
+    old_tqdm = os.environ.get("TQDM_DISABLE")
+    os.environ["TQDM_DISABLE"] = "1"
+    try:
+        yield
+    finally:
+        if old_tqdm is None:
+            os.environ.pop("TQDM_DISABLE", None)
+        else:
+            os.environ["TQDM_DISABLE"] = old_tqdm
+
+
+@contextmanager
+def _null_context() -> Iterator[None]:
+    yield
+
+
+class _FunASRLoadTimingFilter(logging.Filter):
+    """Append checkpoint load duration to FunASR log lines."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._starts: dict[str, float] = {}
+
+    def _format_message(self, record: logging.LogRecord) -> str:
+        msg = record.msg
+        if isinstance(msg, str):
+            if record.args:
+                try:
+                    return msg % record.args
+                except Exception:
+                    return msg
+            return msg
+        return record.getMessage()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = self._format_message(record)
+
+        preload_prefix = "Loading pretrained params from "
+        if text.startswith(preload_prefix):
+            self._starts[text[len(preload_prefix) :]] = time.perf_counter()
+            return True
+
+        ckpt_prefix = "ckpt: "
+        if text.startswith(ckpt_prefix):
+            path = text[len(ckpt_prefix) :]
+            self._starts.setdefault(path, time.perf_counter())
+            return True
+
+        loaded_prefix = "Loading ckpt: "
+        if text.startswith(loaded_prefix) and ", status:" in text:
+            rest = text[len(loaded_prefix) :]
+            path, status_part = rest.split(", status:", 1)
+            start = self._starts.pop(path, None)
+            if start is not None:
+                elapsed = time.perf_counter() - start
+                record.msg = f"Loading ckpt: {path}, status:{status_part} ({elapsed:.1f}s)"
+                record.args = ()
+            return True
+
+        return True
+
+
+@contextmanager
+def _funasr_load_timing_logs() -> Iterator[None]:
+    timing = _FunASRLoadTimingFilter()
+    root = logging.getLogger()
+    root.addFilter(timing)
+    try:
+        yield
+    finally:
+        root.removeFilter(timing)
+
+
+@contextmanager
+def _tqdm_progress_hook(on_percent: Callable[[int], None]) -> Iterator[None]:
+    """Forward FunASR tqdm updates to a GUI progress callback."""
+    import tqdm as tqdm_module
+
+    original = tqdm_module.tqdm
+    peak = 0
+
+    def report(sub_percent: int) -> None:
+        nonlocal peak
+        peak = max(peak, max(0, min(100, sub_percent)))
+        on_percent(peak)
+
+    class ReportingTqdm(original):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._report()
+
+        def update(self, n: float = 1) -> bool | None:
+            result = super().update(n)
+            self._report()
+            return result
+
+        def _report(self) -> None:
+            total = self.total
+            if total and total > 0:
+                report(int(100 * self.n / total))
+
+    tqdm_module.tqdm = ReportingTqdm
+    try:
+        yield
+    finally:
+        tqdm_module.tqdm = original
 
 
 def _normalize_time(value: Any) -> float:
@@ -162,21 +308,34 @@ class FunASRBackend:
                 f"Import error: {exc}"
             ) from exc
 
-        kwargs: dict[str, Any] = {
-            "model": self.asr_model,
-            "vad_model": self.vad_model,
-            "punc_model": self.punc_model,
-            "spk_model": self.spk_model,
-        }
+        spk_kwargs: dict[str, Any] = {"check_latest": False}
         if self.min_speakers is not None:
-            kwargs["spk_kwargs"] = {"min_speakers": self.min_speakers}
+            spk_kwargs["min_speakers"] = self.min_speakers
         if self.max_speakers is not None:
-            spk_kwargs = kwargs.setdefault("spk_kwargs", {})
             spk_kwargs["max_speakers"] = self.max_speakers
+
+        kwargs: dict[str, Any] = {
+            "model": _resolve_modelscope_model(self.asr_model),
+            "vad_model": _resolve_modelscope_model(self.vad_model),
+            "punc_model": _resolve_modelscope_model(self.punc_model),
+            "spk_model": _resolve_modelscope_model(self.spk_model),
+            "disable_update": True,
+            "check_latest": False,
+            "log_level": "WARNING",
+            "vad_kwargs": {"check_latest": False},
+            "punc_kwargs": {"check_latest": False},
+            "spk_kwargs": spk_kwargs,
+        }
 
         try:
             logger.debug("Loading FunASR models: %s", kwargs)
-            self._model = AutoModel(**kwargs)
+            load_started = time.perf_counter()
+            with _funasr_load_timing_logs():
+                self._model = AutoModel(**kwargs)
+            logger.info(
+                "FunASR models loaded in %.1fs",
+                time.perf_counter() - load_started,
+            )
         except Exception as exc:
             raise FunASRLoadError(f"Failed to load FunASR models: {exc}") from exc
 
@@ -187,12 +346,21 @@ class FunASRBackend:
         wav_path: Path,
         source_name: str,
         roles: dict[str, str] | None = None,
+        disable_progress: bool = False,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> Transcript:
         model = self._load_model()
         wav_path = wav_path.resolve()
 
+        if progress_callback is not None:
+            progress_ctx = _tqdm_progress_hook(progress_callback)
+        elif disable_progress:
+            progress_ctx = _disable_progress_bars()
+        else:
+            progress_ctx = _null_context()
         try:
-            res = model.generate(input=str(wav_path), batch_size_s=300)
+            with progress_ctx:
+                res = model.generate(input=str(wav_path), batch_size_s=300)
         except Exception as exc:
             raise FunASREmptyResultError(f"FunASR transcription failed: {exc}") from exc
 
