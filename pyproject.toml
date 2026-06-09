@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wav2chat"
+version = "0.1.0"
+description = "Convert phone/meeting audio into speaker-segmented chat transcripts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "wav2chat contributors" }]
+keywords = ["asr", "funasr", "speaker-diarization", "transcription"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "funasr>=1.0.0",
+    "modelscope>=1.9.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+]
+
+[project.scripts]
+wav2chat = "wav2chat.cli:main"
+
+[tool.setuptools]
+package-dir = { wav2chat = "." }
+packages = ["wav2chat"]
