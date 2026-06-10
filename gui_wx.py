@@ -1413,29 +1413,16 @@ class Wav2ChatFrame(wx.Frame):
     def _refresh_main_toolbar(self) -> None:
         if not hasattr(self, "_breadcrumb_bar") or not hasattr(self, "_main_toolbar"):
             return
-        sizer = self._breadcrumb_bar.GetSizer()
-        if sizer is None:
-            return
         old = self._main_toolbar
         convert_enabled = old.GetToolEnabled(self.ID_CONVERT)
-        replace_index: int | None = None
-        for index in range(sizer.GetItemCount()):
-            if sizer.GetItem(index).GetWindow() == old:
-                replace_index = index
-                break
-        if replace_index is None:
+        sizer = old.GetContainingSizer()
+        if sizer is None:
             return
-        item = sizer.GetItem(replace_index)
-        sizer.Detach(replace_index)
-        old.Destroy()
         toolbar = self._build_main_toolbar(self._breadcrumb_bar)
-        sizer.Insert(
-            replace_index,
-            toolbar,
-            item.GetProportion(),
-            item.GetFlag(),
-            item.GetBorder(),
-        )
+        if not sizer.Replace(old, toolbar):
+            toolbar.Destroy()
+            return
+        old.Destroy()
         self._sync_convert_controls(convert_enabled)
         self._sync_toolbar_toggles()
         self._apply_toolbar_visibility(self._toolbar_visible)
