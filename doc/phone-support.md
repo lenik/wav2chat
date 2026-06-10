@@ -1,5 +1,7 @@
 # Phone import — how it works
 
+[中文版](phone-support-zh.md)
+
 wav2chat imports **call recordings** from a phone connected to the desktop over USB. On Linux this usually means the phone is exposed as an **MTP** (Media Transfer Protocol) volume through **gvfs**, not as a normal block device.
 
 Implementation: `phone_import.py` (scan/copy) and `phone_import_dialog.py` (GUI).
@@ -150,9 +152,44 @@ Deep scan is slower and may pick up false positives on some devices; normal scan
 
 ---
 
+## Default Recordings Location
+
+When **Use default** is enabled in **Edit → Settings…** (F7), the import destination root is chosen in this order (`app_settings.default_recordings_location()`):
+
+| Priority | Path | Used when |
+|----------|------|-----------|
+| 1 | `<prefixdir>/data/Recordings` | `<prefixdir>/data` exists |
+| 2 | `<bindir>/data/Recordings` | `<bindir>/data` exists |
+| 3 | `<Documents>/Recordings` | otherwise (created on first use) |
+
+Definitions:
+
+- **`bindir`** — directory containing `wav2chat.py`. When running from source without that file, the package directory (where `app_settings.py` lives) is used instead.
+- **`prefixdir`** — parent of `bindir`.
+
+Examples:
+
+| Layout | Typical default |
+|--------|-----------------|
+| Installed under `/opt/wav2chat/` with `/opt/data/` | `/opt/data/Recordings` |
+| Portable tree with `./data/` next to sources | `./data/Recordings` |
+| Plain user install, no `data/` dir | `~/Documents/Recordings` |
+
+`<Documents>` follows `XDG_DOCUMENTS_DIR` when set, otherwise `~/Documents`.
+
+You can override the default with a custom folder in Settings; that path is stored in `~/.config/wav2chat/settings.json`.
+
+---
+
 ## Import plan and copy
 
-**Recordings Location** (Settings) is the destination root, e.g.:
+**Recordings Location** is the destination **root**. Imported files are placed under year/month subfolders:
+
+```
+<Recordings Location>/2025/2025-06/recording.mp3
+```
+
+Example with the user fallback:
 
 ```
 ~/Documents/Recordings/2025/2025-06/recording.mp3
@@ -160,8 +197,9 @@ Deep scan is slower and may pick up false positives on some devices; normal scan
 
 `plan_phone_import()`:
 
-- Destination: `Recordings/<year>/<year-MM>/<original filename>`
-- Skips files that **already exist** at the destination (counts as “already imported”)
+- Destination: `<Recordings Location>/<year>/<year-MM>/<original filename>`
+- Month folders are derived from the source file’s modification time.
+- Skips files that **already exist** at the destination (counts as “already imported”).
 
 `run_phone_import()`:
 
@@ -169,6 +207,8 @@ Deep scan is slower and may pick up false positives on some devices; normal scan
 - Optional: **Delete from phone after import** — uses `shutil.move` (copy + delete source)
 
 Progress is reported per file in the dialog status bar.
+
+After import, select files in the file browser and **Convert** to produce a readable `.txt` and structured `.chatlog` sidecar next to each audio file.
 
 ---
 
@@ -189,11 +229,15 @@ If a device stores calls in a **non-standard path**, deep scan may find them; ot
 ## GUI flow (`phone_import_dialog.py`)
 
 1. Open **File → Import from phone…** (Ctrl+I).
-2. Dialog scans mounts, then each device’s call-recording folders.
+2. Dialog scans mounts, then each device’s call-recording folders (runs in a background thread).
 3. Choose device, review **new / total** counts, optionally enable delete-after-import.
-4. **Import** copies files; on success the file browser can jump to the destination month folder.
+4. **Rescan** refreshes the device list and recording counts without closing the dialog.
+5. **Import** copies files in a background thread; on success the main window file browser jumps to the first imported month folder.
+6. After import finishes, the dialog **rescans the phone asynchronously** so counts stay accurate (especially when delete-after-import is enabled).
 
 Scan details appear in the dialog **bottom status bar** only (not duplicated in the main window log stream).
+
+Press **Esc** to close the dialog (blocked while import is running).
 
 ---
 
@@ -205,6 +249,7 @@ Scan details appear in the dialog **bottom status bar** only (not duplicated in 
 | 0 recordings | Call recording enabled on phone; open `call_rec` (or vendor path) in file manager from PC |
 | Count too high | Usually fixed by strict non-recursive scan; report device model + path if wrong |
 | Import fails mid-way | Disk space; gvfs disconnect; keep USB connected until finished |
+| Wrong destination folder | **Edit → Settings…** — check default vs custom Recordings Location |
 
 Manual check:
 
@@ -217,11 +262,15 @@ ls "/run/user/$(id -u)/gvfs/"
 
 ## Related settings
 
-| Setting | File | Purpose |
-|---------|------|---------|
-| Recordings Location | `app_settings.py` | Import destination root |
+| Setting | File / key | Purpose |
+|---------|------------|---------|
+| Recordings Location (default) | `app_settings.py` → `default_recordings_location()` | Resolved import root when “Use default” is on |
+| Custom Recordings Location | `custom_recordings_location` | User override in Settings |
 | Delete after import | `phone_delete_after_import` | Move vs copy |
-| Home breadcrumb button | Main window | Jumps browser to Recordings Location |
+| Home breadcrumb button | Main window | Jumps file browser to Recordings Location |
+| Settings dialog | **Edit → Settings…** (F7) | Change Recordings Location |
+
+Persistent GUI state (window layout, last browser directory, etc.) is stored in `~/.config/wav2chat/settings.json`.
 
 ---
 
@@ -235,5 +284,7 @@ ls "/run/user/$(id -u)/gvfs/"
 | `_call_recording_dirs()` | Per-vendor folder list |
 | `_collect_from_dirs()` | Scan known folders |
 | `_fallback_scan()` | Deep heuristic scan |
+| `destination_for_recording()` | Build `<year>/<year-MM>/<name>` path |
 | `plan_phone_import()` | Build import queue, skip existing |
 | `run_phone_import()` | Copy/move files |
+| `rescan_device_recordings()` | Refresh one device after import |
