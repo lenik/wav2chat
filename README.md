@@ -122,9 +122,12 @@ The GUI provides:
 - File menu: open waveform, open saved chat session (`.json`), exit
 - Left panel: audio path selector, droppable file queue with status markers
   (`?` unconverted, spinner while converting, `=` converted)
+- Speaker count (`min`–`max`, default 2–2 for phone calls)
+- **Refresh models** checkbox (re-download from ModelScope on next convert; default uses local cache)
 - Convert button and Auto Convert checkbox
 - Right panel: session title, timestamp/duration, list or bubble chat view
-- Status bar for conversion progress
+- Status bar and optional log panel for conversion progress
+- File list: `Delete` removes selected queue items; `Ctrl+A` selects all
 
 You can pass the same options as the CLI, for example:
 
@@ -148,6 +151,22 @@ wav2chat ./calls --batch -o ./texts --json ./jsons
 
 A failure on one file does not stop the batch. Errors go to stderr and are summarized at the end.
 
+## Recording filenames (by phone brand)
+
+Call-recording naming varies by manufacturer. wav2chat parses **filenames** for contact name, phone number, and recording time (used in the GUI list title and sort order; falls back to file mtime if parsing fails).
+
+| Brand | Typical pattern | Example |
+|-------|-----------------|--------|
+| **iPhone (iOS)** | `通话录音-date-time` | `通话录音-20260610-173005.m4a` |
+| **Xiaomi / Redmi** | `number_date_time` or `name_compact-time` | `13800138000_20260610_173000.mp3`, `李经理_20260610173000.mp3` |
+| **Huawei / Honor** | `name_date_time` (dashed) | `张三_2026-06-10_17-30-22.mp3` |
+| **OPPO / OnePlus** | `REC_number_compact-time` | `REC_13800138000_20260610173000.mp3` |
+| **vivo / iQOO** | `number_compact-time` | `13800138000_20260610173000.mp3` |
+| **Samsung** | `通话录音_date_time` | `通话录音_20260610_173000.mp3` |
+| **Generic** | `name(phone)_timestamp` | `常汉杰(15967387860)_20230714151024.mp3` |
+
+The GUI shows `Name (phone)` or the number alone. See `filename_meta.py` for parsing rules.
+
 ## Output examples
 
 ### txt
@@ -167,17 +186,29 @@ Without `--role`, speakers appear as `spk0`, `spk1`, etc.
 {
   "source": "call.m4a",
   "duration": 7.6,
+  "primary_speaker": 1,
+  "speakers": [
+    { "name": "spk0", "role": "Other", "gender": "", "avatar": "👦" },
+    { "name": "spk1", "role": "me", "gender": "", "avatar": "👧" }
+  ],
   "segments": [
     {
       "start": 1.2,
       "end": 3.8,
-      "speaker": "spk0",
-      "role": "Me",
+      "speaker": 0,
       "text": "喂，你好。"
+    },
+    {
+      "start": 4.1,
+      "end": 7.6,
+      "speaker": 1,
+      "text": "你好，我想问一下续贷的事情。"
     }
   ]
 }
 ```
+
+Legacy JSON (string `speaker` / per-segment `role`) is migrated automatically when loaded. Use `jsonfix *.json` to rewrite files to the new format.
 
 ## CLI options
 
@@ -192,19 +223,97 @@ Without `--role`, speakers appear as `spk0`, `spk1`, etc.
 | `-n, --min-speakers` | Minimum number of speakers |
 | `-m, --max-speakers` | Maximum number of speakers |
 | `-r, --role SPK=NAME` | Speaker display name; repeatable |
+| `--refresh-models` | Re-check ModelScope and reload models (default: local cache + mmap) |
 | `-k, --keep-temp` | Keep intermediate wav |
 | `-v, --verbose` | Debug output |
 | `-q, --quiet` | Suppress non-error output |
 | `-g, --gui` | Open the desktop GUI |
+| `--ui-lang` | GUI language: `en`, `zh`, `ja`, `ko` |
+| `--version` | Show version and dependency info |
 
 ## Pipeline
 
 ```text
 audio file
   → ffmpeg to mono / 16 kHz / wav
-  → FunASR (paraformer-zh + fsmn-vad + ct-punc + cam++)
+  → FunASR long-audio pipeline:
+      1. fsmn-vad — detect speech segments
+      2. paraformer-zh — speech recognition per segment
+      3. ct-punc — punctuation restoration
+      4. cam++ — speaker diarization (embeddings + clustering)
   → txt / json
 ```
+
+This is **not** a single ASR pass. Diarization and punctuation add significant compute, especially on CPU.
+
+## Performance and tuning
+
+### Why does it take so long?
+
+| Phase | What happens | Typical cost |
+|-------|----------------|----------------|
+| **Model load** | Four models (ASR, VAD, punctuation, speaker) loaded into memory | ~10–40 s first time in a session; skipped if already loaded |
+| **Normalize** | ffmpeg → mono 16 kHz WAV | Usually seconds |
+| **Transcribe** | VAD + ASR + punctuation + speaker separation on full audio | Often **0.2–1.0× realtime** on CPU (10 min audio → ~2–10 min); much faster on GPU |
+
+On **CPU**, FunASR disables dynamic batching and processes VAD segments largely one-by-one, which makes long phone calls slow. That is FunASR behaviour, not extra overhead from wav2chat.
+
+**Progress in the GUI:** status like `[1/1] file — Transcribing (25%)` may advance every few seconds even when FunASR does not report fine-grained progress (heartbeat). Use `-v` / **Show log** to see `Transcribing …` and FunASR timing lines. Model load shows `Loading FunASR models…` before transcribe starts.
+
+### Model loading (cache / refresh)
+
+**First ever run:** ModelScope downloads paraformer-zh, fsmn-vad, ct-punc, and cam++ to the ModelScope cache (often under `~/.cache/modelscope/`). Needs disk space and network; happens once per model version.
+
+**Default afterwards:**
+
+- wav2chat resolves **local cache paths** and skips hub update checks (`disable_update=True`)
+- Checkpoints are read with **`torch.load(…, mmap=True)`** where supported
+- The GUI/CLI keeps one **in-memory model** for the session — a second conversion in the same window does not reload weights
+- **jieba** (used by the punctuation model) uses a persistent cache at `~/.cache/wav2chat/jieba/` (or `$XDG_CACHE_HOME/wav2chat/jieba/`). The cache is rebuilt only when the jieba dictionary or package version changes
+
+**Force refresh** (broken cache, new upstream model):
+
+```bash
+wav2chat --refresh-models call.m4a
+```
+
+Or check **Refresh models** in the GUI before Convert (auto-unchecks after one reload).
+
+Clear jieba cache manually: `rm -rf ~/.cache/wav2chat/jieba/`
+
+Check environment: `wav2chat --version`
+
+### Speed vs quality
+
+Parameters you can control **today** (CLI / GUI):
+
+| Parameter | Speed | Quality / accuracy | Notes |
+|-----------|-------|-------------------|--------|
+| **GPU vs CPU** | GPU often **5–20× faster** | Similar | Install CUDA-enabled PyTorch; FunASR picks `cuda:0` when available |
+| **`--min-speakers` / `--max-speakers`** | Narrow range (e.g. `2`–`2`) speeds clustering | Better for known two-party calls | GUI: speaker count row, default 2–2 |
+| **`--refresh-models`** | Slower (hub check + full reload) | Same after refresh | Use only when cache is stale |
+| **`--verbose`** | No change | — | Shows FunASR load/transcribe logs and RTF hints |
+
+**Hardcoded in wav2chat today** (FunASR `generate()` kwargs — not yet CLI flags):
+
+| Parameter | Current value | Effect |
+|-----------|---------------|--------|
+| `batch_size_s` | `300` | Max batch duration (seconds) for ASR on GPU; CPU batching is limited by FunASR |
+| `batch_size_threshold_s` | FunASR default `60` | Segments shorter than this may be batched together |
+| `vad_kwargs.max_single_segment_time` | FunASR default ~60000 ms | Max VAD segment length; larger → fewer splits, slightly faster, may blur speaker boundaries |
+| Models | paraformer-zh + fsmn-vad + ct-punc + cam++ | Full pipeline; skipping speaker model would be much faster but wav2chat always enables diarization |
+| `ncpu` | FunASR default `4` | CPU threads inside FunASR |
+
+### Practical recommendations
+
+1. **Use a GPU** when possible — largest win for long recordings.
+2. **Phone calls:** set `--min-speakers 2 --max-speakers 2` (GUI default).
+3. **Same session:** keep the GUI open; models stay loaded after the first convert.
+4. **Do not use Refresh models** unless you need to re-download or fix a corrupt cache.
+5. **Long jobs:** enable log panel or `-v`; ignore coarse percentage if CPU transcribe runs for many minutes — check that status says **Transcribing**, not **Loading models**.
+6. **Wrong speakers:** tune speaker count and `--role`; diarization order may not match real identities.
+
+Future CLI/GUI presets (e.g. `--fast` without diarization, `--device`, `--batch-size-s`) may be added; see `funasr_backend.py` for the integration point.
 
 ## FAQ
 
@@ -218,11 +327,11 @@ sudo apt install -y ffmpeg
 
 ### First run is slow
 
-FunASR downloads ASR, VAD, punctuation, and speaker-diarization models from ModelScope on first use. This is expected. Use `--verbose` for progress-related logs.
+FunASR downloads four models from ModelScope on first use. Later runs load from the local ModelScope cache with mmap. See [Performance and tuning](#performance-and-tuning).
 
 ### CUDA / CPU
 
-If PyTorch with CUDA is installed, FunASR will try to use the GPU; otherwise it runs on CPU. Long recordings are slower on CPU.
+If PyTorch with CUDA is installed, FunASR will try to use the GPU; otherwise it runs on CPU. Long recordings are much slower on CPU — often 0.2–1.0× realtime for the full diarization pipeline. See [Performance and tuning](#performance-and-tuning).
 
 ### Wrong speaker labels
 
@@ -266,7 +375,12 @@ wav2chat/
   gui.py
   pipeline.py
   audio.py
+  filename_meta.py
   funasr_backend.py
+  jieba_cache.py
+  jsonfix.py
+  speaker_ui.py
+  i18n.py
   render.py
   models.py
 ```
