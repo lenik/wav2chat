@@ -7,7 +7,6 @@ import logging
 import sys
 from pathlib import Path
 
-from wav2chat import __version__
 from wav2chat.errors import (
     EmptyBatchDirectoryError,
     InputNotFoundError,
@@ -24,6 +23,36 @@ from wav2chat.pipeline import (
     is_supported_audio,
     write_transcript_outputs,
 )
+
+
+from wav2chat.version_info import format_version_info
+
+
+class _VersionAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str = argparse.SUPPRESS,
+        default: str = argparse.SUPPRESS,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            default=default,
+            help=help,
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        print(format_version_info())
+        parser.exit()
 
 
 def _parse_roles(values: list[str] | None) -> dict[str, str]:
@@ -230,8 +259,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
+        action=_VersionAction,
+        help="Show program version and dependency information",
     )
     return parser
 
