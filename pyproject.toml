@@ -36,6 +36,7 @@ dependencies = [
 
 [project.scripts]
 wav2chat = "wav2chat.cli:main"
+jsonfix = "wav2chat.jsonfix:main"
 
 [tool.setuptools]
 package-dir = { wav2chat = "." }

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from wav2chat.errors import FunASREmptyResultError, FunASRLoadError
-from wav2chat.models import Segment, Transcript
+from wav2chat.models import Segment, Transcript, index_string_speaker_segments
 
 logger = logging.getLogger(__name__)
 
@@ -223,14 +223,12 @@ def _extract_speaker(item: dict[str, Any]) -> str:
 
 def _parse_sentence_info(
     result: dict[str, Any],
-    roles: dict[str, str] | None = None,
-) -> list[Segment]:
+) -> list[tuple[float, float, str, str]]:
     sentence_info = result.get("sentence_info")
     if not isinstance(sentence_info, list):
         return []
 
-    role_map = roles or {}
-    segments: list[Segment] = []
+    segments: list[tuple[float, float, str, str]] = []
 
     for item in sentence_info:
         if not isinstance(item, dict):
@@ -240,15 +238,7 @@ def _parse_sentence_info(
             continue
         start, end = _extract_times(item)
         speaker = _extract_speaker(item)
-        segments.append(
-            Segment(
-                start=start,
-                end=end,
-                speaker=speaker,
-                role=role_map.get(speaker),
-                text=text,
-            )
-        )
+        segments.append((start, end, speaker, text))
 
     return segments
 
@@ -365,27 +355,21 @@ class FunASRBackend:
             raise FunASREmptyResultError(f"FunASR transcription failed: {exc}") from exc
 
         result = _unwrap_generate_result(res)
-        segments = _parse_sentence_info(result, roles=roles)
+        raw_segments = _parse_sentence_info(result)
 
-        if not segments:
+        if not raw_segments:
             fallback_text = _extract_text(result)
             if fallback_text:
-                segments = [
-                    Segment(
-                        start=0.0,
-                        end=0.0,
-                        speaker="spk0",
-                        role=(roles or {}).get("spk0"),
-                        text=fallback_text,
-                    )
-                ]
+                raw_segments = [(0.0, 0.0, "spk0", fallback_text)]
             else:
                 raise FunASREmptyResultError(
                     "FunASR returned no sentence_info and no fallback text."
                 )
 
+        speakers, segments = index_string_speaker_segments(raw_segments, roles=roles)
         return Transcript(
             source=source_name,
             duration=_estimate_duration(segments),
+            speakers=speakers,
             segments=segments,
         )

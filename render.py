@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from wav2chat.models import Transcript
+from wav2chat.models import Segment, Transcript
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -17,8 +17,8 @@ def _format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
-def _display_name(segment) -> str:
-    return segment.role if segment.role else segment.speaker
+def display_name(transcript: Transcript, segment: Segment) -> str:
+    return transcript.speaker_label(segment.speaker)
 
 
 def render_txt(transcript: Transcript) -> str:
@@ -26,17 +26,13 @@ def render_txt(transcript: Transcript) -> str:
     for segment in transcript.segments:
         start = _format_timestamp(segment.start)
         end = _format_timestamp(segment.end)
-        name = _display_name(segment)
+        name = display_name(transcript, segment)
         lines.append(f"[{start} - {end}] {name}: {segment.text}")
     return "\n".join(lines).rstrip() + "\n"
 
 
 def format_timestamp(seconds: float) -> str:
     return _format_timestamp(seconds)
-
-
-def display_name(segment) -> str:
-    return _display_name(segment)
 
 
 def render_json(transcript: Transcript) -> str:
