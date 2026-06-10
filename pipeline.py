@@ -18,6 +18,10 @@ from wav2chat.render import render_json, render_txt
 
 SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".amr", ".aac", ".flac", ".ogg"}
 
+CHATLOG_EXTENSION = ".chatlog"
+LEGACY_JSON_EXTENSION = ".json"
+TRANSCRIPT_EXTENSIONS = {CHATLOG_EXTENSION, LEGACY_JSON_EXTENSION}
+
 # phase, file_percent (0-100 within the current file, or None if unknown)
 ProgressCallback = Callable[[str, int | None], None]
 
@@ -130,8 +134,24 @@ def convert_file(
             temp_ctx.cleanup()
 
 
+def is_transcript_path(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in TRANSCRIPT_EXTENSIONS
+
+
 def default_json_path(input_path: Path) -> Path:
-    return input_path.with_suffix(".json")
+    """Return the default sidecar path for structured transcript output."""
+    return input_path.with_suffix(CHATLOG_EXTENSION)
+
+
+def find_transcript_path(input_path: Path) -> Path | None:
+    """Return an existing transcript sidecar, preferring .chatlog over legacy .json."""
+    chatlog_path = input_path.with_suffix(CHATLOG_EXTENSION)
+    if chatlog_path.is_file():
+        return chatlog_path
+    legacy_path = input_path.with_suffix(LEGACY_JSON_EXTENSION)
+    if legacy_path.is_file():
+        return legacy_path
+    return None
 
 
 def default_txt_path(input_path: Path) -> Path:

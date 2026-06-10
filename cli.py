@@ -19,6 +19,7 @@ from wav2chat.i18n import set_locale
 from wav2chat.pipeline import (
     SUPPORTED_EXTENSIONS,
     convert_file,
+    default_json_path,
     default_txt_path,
     is_supported_audio,
     write_transcript_outputs,
@@ -186,7 +187,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         dest="json_output",
         type=Path,
-        help="Output .json file, or output directory in batch mode",
+        help="Output .chatlog file, or output directory in batch mode",
     )
     parser.add_argument(
         "-b",
@@ -312,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
 
             for file_path in files:
                 txt_path = txt_dir / f"{file_path.stem}.txt"
-                json_path = json_dir / f"{file_path.stem}.json" if json_dir is not None else None
+                json_path = json_dir / default_json_path(file_path).name if json_dir is not None else None
                 try:
                     _process_file(
                         input_path=file_path,
