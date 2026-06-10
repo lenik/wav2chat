@@ -8,7 +8,7 @@ from pathlib import Path
 import wx
 
 from wav2chat.app_settings import AppSettings, default_recordings_location
-from wav2chat.dialog_utils import bind_dialog_escape_close
+from wav2chat.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
 from wav2chat.i18n import t
 
 
@@ -65,6 +65,7 @@ class SettingsDialog(wx.Dialog):
         sizer.Add(form, 1, wx.EXPAND | wx.ALL, 12)
         sizer.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
         self.SetSizer(sizer)
+        setup_dialog_fonts(self)
         self.Bind(wx.EVT_BUTTON, self._on_ok, ok_btn)
         self._sync_recordings_controls()
         bind_dialog_escape_close(self, modal_cancel=True)

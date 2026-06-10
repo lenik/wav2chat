@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import wx
 
-from wav2chat.dialog_utils import bind_dialog_escape_close
+from wav2chat.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
 from wav2chat.i18n import t
 from wav2chat.models import (
     DEFAULT_SPEAKER_AVATARS,
@@ -137,9 +137,11 @@ class EmojiPickerDialog(wx.Dialog):
         scroll = wx.ScrolledWindow(self, style=wx.VSCROLL)
         scroll.SetScrollRate(0, 44)
         grid = wx.GridSizer(cols=8, hgap=4, vgap=4)
+        emoji_button_ids: set[int] = set()
         for emoji in EMOJI_AVATAR_CHOICES:
             button = wx.Button(scroll, label=emoji, size=wx.Size(36, 36))
             button.SetFont(_pick_emoji_font(18))
+            emoji_button_ids.add(button.GetId())
             button.Bind(wx.EVT_BUTTON, lambda _e, value=emoji: self._choose(value))
             grid.Add(button, 0, wx.EXPAND)
         scroll.SetSizer(grid)
@@ -148,6 +150,7 @@ class EmojiPickerDialog(wx.Dialog):
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(scroll, 1, wx.EXPAND | wx.ALL, 10)
         self.SetSizer(sizer)
+        setup_dialog_fonts(self, skip=emoji_button_ids)
         bind_dialog_escape_close(self, modal_cancel=True)
         self.CentreOnParent()
 
@@ -213,6 +216,7 @@ class SpeakerProfileDialog(wx.Dialog):
         sizer.Add(form, 1, wx.EXPAND | wx.ALL, 12)
         sizer.Add(close_btn, 0, wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, 12)
         self.SetSizer(sizer)
+        setup_dialog_fonts(self, skip={self._avatar_preview.GetId()})
         self.Bind(wx.EVT_CLOSE, self._on_close)
         bind_dialog_escape_close(self)
         self.CentreOnParent()

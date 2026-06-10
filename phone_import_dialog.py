@@ -8,7 +8,7 @@ import threading
 import wx
 
 from wav2chat.app_settings import AppSettings
-from wav2chat.dialog_utils import bind_dialog_escape_close
+from wav2chat.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
 from wav2chat.i18n import t
 from wav2chat.phone_import import (
     PhoneDeviceInfo,
@@ -127,6 +127,7 @@ class PhoneImportDialog(wx.Dialog):
         outer.Add(self._statusbar_panel, 0, wx.EXPAND)
         self.SetSizer(outer)
 
+        setup_dialog_fonts(self)
         self.Bind(wx.EVT_CLOSE, self._on_close)
         self.Bind(wx.EVT_SIZE, self._on_dialog_size)
         bind_dialog_escape_close(self)
