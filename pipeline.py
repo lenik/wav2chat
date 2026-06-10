@@ -60,6 +60,42 @@ def is_supported_audio(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
+def collect_supported_audio_paths(paths: list[Path]) -> list[Path]:
+    """Expand paths into supported audio files; directories are scanned recursively."""
+    collected: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        resolved = path.resolve()
+        if is_supported_audio(resolved) and resolved not in seen:
+            seen.add(resolved)
+            collected.append(resolved)
+
+    def walk_dir(directory: Path) -> None:
+        stack = [directory]
+        while stack:
+            current = stack.pop()
+            try:
+                children = sorted(current.iterdir(), key=lambda p: p.name.casefold())
+            except OSError:
+                continue
+            for child in children:
+                if child.is_dir():
+                    stack.append(child)
+                else:
+                    add(child)
+
+    for raw in paths:
+        path = raw.expanduser().resolve()
+        if path.is_dir():
+            walk_dir(path)
+        else:
+            add(path)
+
+    collected.sort(key=lambda p: str(p).casefold())
+    return collected
+
+
 def convert_file(
     input_path: Path,
     backend: FunASRBackend,

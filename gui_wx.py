@@ -34,6 +34,7 @@ from wav2chat.models import Segment, Speaker, Transcript
 from wav2chat.pipeline import (
     CHATLOG_EXTENSION,
     SUPPORTED_EXTENSIONS,
+    collect_supported_audio_paths,
     convert_file,
     default_json_path,
     find_transcript_path,
@@ -3275,24 +3276,7 @@ class Wav2ChatFrame(wx.Frame):
         self._set_file_row_status_image(list_row, entry)
 
     def _collect_import_paths(self, paths: list[Path]) -> list[Path]:
-        collected: list[Path] = []
-        seen: set[Path] = set()
-        for raw in paths:
-            path = raw.expanduser().resolve()
-            if path.is_dir():
-                try:
-                    children = sorted(path.iterdir())
-                except OSError:
-                    continue
-                for child in children:
-                    if is_supported_audio(child) and child not in seen:
-                        seen.add(child)
-                        collected.append(child)
-                continue
-            if is_supported_audio(path) and path not in seen:
-                seen.add(path)
-                collected.append(path)
-        return collected
+        return collect_supported_audio_paths(paths)
 
     def _refresh_entry_metadata(self, entry: FileEntry) -> bool:
         changed = False
