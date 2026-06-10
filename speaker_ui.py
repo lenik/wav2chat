@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import wx
 
+from wav2chat.dialog_utils import bind_dialog_escape_close
 from wav2chat.i18n import t
 from wav2chat.models import (
     DEFAULT_SPEAKER_AVATARS,
@@ -147,6 +148,7 @@ class EmojiPickerDialog(wx.Dialog):
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(scroll, 1, wx.EXPAND | wx.ALL, 10)
         self.SetSizer(sizer)
+        bind_dialog_escape_close(self, modal_cancel=True)
         self.CentreOnParent()
 
     def _choose(self, emoji: str) -> None:
@@ -212,6 +214,7 @@ class SpeakerProfileDialog(wx.Dialog):
         sizer.Add(close_btn, 0, wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, 12)
         self.SetSizer(sizer)
         self.Bind(wx.EVT_CLOSE, self._on_close)
+        bind_dialog_escape_close(self)
         self.CentreOnParent()
 
     def _readonly_field(self, value: str) -> wx.TextCtrl:
