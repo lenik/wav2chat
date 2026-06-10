@@ -128,6 +128,15 @@ def _menu_stock_bitmap(art_id: str) -> wx.Bitmap:
     )
 
 
+def _play_stock_bitmap(size: int = 16) -> wx.Bitmap:
+    """Toolbar/button play icon; gtk-media-play on GTK, GO_FORWARD elsewhere."""
+    px = wx.Size(size, size)
+    play = wx.ArtProvider.GetBitmap("gtk-media-play", wx.ART_BUTTON, px)
+    if play.IsOk():
+        return play
+    return wx.ArtProvider.GetBitmap(wx.ART_GO_FORWARD, wx.ART_BUTTON, px)
+
+
 def _append_menu_item(
     menu: wx.Menu,
     item_id: int,
@@ -708,6 +717,9 @@ class Wav2ChatFrame(wx.Frame):
         self._toolbar_visible = self.app_settings.toolbar_visible
         self._splitter_browser_pos = self.app_settings.splitter_browser_pos or 240
         self._splitter_file_pos = self.app_settings.splitter_main_pos or FILE_PANEL_DEFAULT_WIDTH
+        self._pending_tree_directory: Path | None = None
+        self._tree_needs_init = False
+        self._file_list_needs_sync = False
         self._avatar_panels: dict[int, RoundedAvatarPanel] = {}
 
         self._build_ui()
@@ -734,6 +746,7 @@ class Wav2ChatFrame(wx.Frame):
             start_dir = first.parent if first.is_file() else first
         self._select_tree_directory(start_dir)
         self._load_directory_files(start_dir)
+        wx.CallAfter(self._apply_locale)
         wx.CallAfter(self._restore_layout)
 
     def _build_ui(self) -> None:
@@ -767,9 +780,9 @@ class Wav2ChatFrame(wx.Frame):
         self._breadcrumb_bar.SetSizer(breadcrumb_sizer)
         self._apply_breadcrumb_nav_colours()
 
-        self._workspace_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self._tree_panel = wx.Panel(self._content_wrap)
-        self._work_panel = wx.Panel(self._content_wrap)
+        self._browser_splitter = wx.SplitterWindow(self._content_wrap, style=wx.SP_LIVE_UPDATE)
+        self._tree_panel = wx.Panel(self._browser_splitter)
+        self._work_panel = wx.Panel(self._browser_splitter)
 
         splitter_main = wx.SplitterWindow(self._work_panel, style=wx.SP_LIVE_UPDATE)
         self._file_panel = wx.Panel(splitter_main)
@@ -833,7 +846,14 @@ class Wav2ChatFrame(wx.Frame):
         speaker_row.Add(self._label_speaker_unit, 0, wx.ALIGN_CENTER_VERTICAL)
 
         control_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._btn_convert = wx.Button(self._file_panel, label=t("button.convert"))
+        play_bitmap = _play_stock_bitmap()
+        if play_bitmap.IsOk():
+            self._btn_convert.SetBitmap(play_bitmap)
+            self._btn_convert.SetBitmapPosition(wx.LEFT)
+        self._btn_convert.Bind(wx.EVT_BUTTON, self._on_convert_clicked)
         self._chk_auto_convert = wx.CheckBox(self._file_panel, label=t("button.auto_convert"))
+        control_row.Add(self._btn_convert, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
         control_row.AddStretchSpacer(1)
         control_row.Add(self._chk_auto_convert, 0, wx.ALIGN_CENTER_VERTICAL)
 
@@ -850,8 +870,13 @@ class Wav2ChatFrame(wx.Frame):
         work_sizer.Add(splitter_main, 1, wx.EXPAND)
         self._work_panel.SetSizer(work_sizer)
 
-        self._workspace_sizer.Add(self._tree_panel, 0, wx.EXPAND | wx.RIGHT, SPLITTER_GUTTER)
-        self._workspace_sizer.Add(self._work_panel, 1, wx.EXPAND | wx.LEFT, SPLITTER_GUTTER)
+        self._browser_splitter.SplitVertically(
+            self._tree_panel,
+            self._work_panel,
+            self._splitter_browser_pos,
+        )
+        self._browser_splitter.SetMinimumPaneSize(MIN_TREE_PANEL_WIDTH)
+        self._browser_splitter.SetSashGravity(0.0)
 
         self._init_directory_tree()
 
@@ -891,7 +916,7 @@ class Wav2ChatFrame(wx.Frame):
         chat_panel.SetSizer(chat_outer)
 
         content_sizer.Add(self._breadcrumb_bar, 0, wx.EXPAND | wx.BOTTOM, 4)
-        content_sizer.Add(self._workspace_sizer, 1, wx.EXPAND)
+        content_sizer.Add(self._browser_splitter, 1, wx.EXPAND)
         self._content_wrap.SetSizer(content_sizer)
         self._splitter_main = splitter_main
         self._chat_panel = chat_panel
@@ -1100,6 +1125,10 @@ class Wav2ChatFrame(wx.Frame):
         self._file_list.SetDropTarget(_PathDropTarget(self._import_dropped_paths))
 
     def _init_directory_tree(self) -> None:
+        if not self._directory_tree_ui_active():
+            self._tree_needs_init = True
+            return
+        self._tree_needs_init = False
         self._dir_tree.DeleteAllItems()
         root_path = Path("/")
         root = self._dir_tree.AddRoot("/")
@@ -1276,7 +1305,7 @@ class Wav2ChatFrame(wx.Frame):
             wx.ART_TOOLBAR,
             self._home_nav_bitmap_size(),
         )
-        button = wx.Button(parent, label=t("toolbar.home"))
+        button = wx.Button(parent, label=t("button.home"))
         if bitmap.IsOk():
             button.SetBitmap(bitmap)
         button.Bind(wx.EVT_BUTTON, lambda _event: self._on_toolbar_home())
@@ -1287,7 +1316,7 @@ class Wav2ChatFrame(wx.Frame):
         if not hasattr(self, "_home_nav_button"):
             return
         button = self._home_nav_button
-        button.SetLabel(t("toolbar.home"))
+        button.SetLabel(t("button.home"))
         bitmap = wx.ArtProvider.GetBitmap(
             wx.ART_GO_HOME,
             wx.ART_TOOLBAR,
@@ -1296,6 +1325,17 @@ class Wav2ChatFrame(wx.Frame):
         if bitmap.IsOk():
             button.SetBitmap(bitmap)
         self._breadcrumb_bar.Layout()
+
+    def _sync_convert_controls(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            enabled = not self._converting_active
+        if hasattr(self, "_main_toolbar"):
+            self._main_toolbar.EnableTool(self.ID_CONVERT, enabled)
+        if hasattr(self, "_btn_convert"):
+            self._btn_convert.Enable(enabled)
+
+    def _on_convert_clicked(self, _event: wx.CommandEvent) -> None:
+        self.convert_pending()
 
     def _apply_toolbar_size(self) -> None:
         if not hasattr(self, "_main_toolbar"):
@@ -1307,7 +1347,7 @@ class Wav2ChatFrame(wx.Frame):
             bitmap = wx.ArtProvider.GetBitmap(art_id, wx.ART_TOOLBAR, size)
             toolbar.SetToolNormalBitmap(tool_id, bitmap)
         convert_enabled = not self._converting_active
-        toolbar.EnableTool(self.ID_CONVERT, convert_enabled)
+        self._sync_convert_controls(convert_enabled)
         toolbar.Realize()
         self._update_home_nav_button()
         self._breadcrumb_bar.Layout()
@@ -1396,7 +1436,7 @@ class Wav2ChatFrame(wx.Frame):
             item.GetFlag(),
             item.GetBorder(),
         )
-        toolbar.EnableTool(self.ID_CONVERT, convert_enabled)
+        self._sync_convert_controls(convert_enabled)
         self._sync_toolbar_toggles()
         self._apply_toolbar_visibility(self._toolbar_visible)
         self._breadcrumb_bar.Layout()
@@ -1531,18 +1571,75 @@ class Wav2ChatFrame(wx.Frame):
         self.app_settings.refresh_models = self.settings.refresh_models
         save_app_settings(self.app_settings)
 
+    def _directory_tree_ui_active(self) -> bool:
+        if not self._directory_tree_visible:
+            return False
+        if not hasattr(self, "_browser_splitter"):
+            return False
+        return self._browser_splitter.IsSplit() and self._tree_panel.IsShown()
+
+    def _flush_deferred_browser_ui(self) -> None:
+        if not self._directory_tree_ui_active():
+            return
+        if self._tree_needs_init or self._tree_root_item is None or not self._tree_root_item.IsOk():
+            self._init_directory_tree()
+        pending_tree = self._pending_tree_directory
+        if pending_tree is not None:
+            self._pending_tree_directory = None
+            self._select_tree_directory(pending_tree)
+        if self._file_list_needs_sync:
+            self._file_list_needs_sync = False
+            self._sync_file_list(force=True)
+
+    def _clamp_browser_splitter_sash(self, sash: int) -> int:
+        if not hasattr(self, "_browser_splitter"):
+            return max(MIN_TREE_PANEL_WIDTH, sash)
+        client = self._browser_splitter.GetClientSize()
+        if client.width <= 0:
+            return max(MIN_TREE_PANEL_WIDTH, sash)
+        sash_width = self._browser_splitter.GetSashSize()
+        min_work = MIN_FILE_PANEL_WIDTH + MIN_CHAT_PANEL_WIDTH + sash_width
+        max_tree = client.width - min_work - sash_width
+        if max_tree < MIN_TREE_PANEL_WIDTH:
+            return MIN_TREE_PANEL_WIDTH
+        return max(MIN_TREE_PANEL_WIDTH, min(sash, max_tree))
+
     def _sync_tree_column_width(self) -> None:
+        if not hasattr(self, "_browser_splitter"):
+            return
+        splitter = self._browser_splitter
         if self._directory_tree_visible:
-            width = max(MIN_TREE_PANEL_WIDTH, self._splitter_browser_pos)
+            splitter.SetMinimumPaneSize(MIN_TREE_PANEL_WIDTH)
             self._tree_panel.Show()
-            self._tree_panel.SetMinSize((width, -1))
-            self._tree_panel.SetMaxSize((width, -1))
+            self._work_panel.Show()
+            sash = self._clamp_browser_splitter_sash(self._splitter_browser_pos)
+            if not splitter.IsSplit():
+                splitter.SplitVertically(self._tree_panel, self._work_panel, sash)
+            else:
+                splitter.SetSashPosition(sash)
         else:
-            self._tree_panel.Hide()
-            self._tree_panel.SetMinSize((0, 0))
-            self._tree_panel.SetMaxSize((0, 0))
-        if hasattr(self, "_workspace_sizer"):
-            self._workspace_sizer.Layout()
+            if splitter.IsSplit():
+                current = splitter.GetSashPosition()
+                if current > 0:
+                    self._splitter_browser_pos = current
+                splitter.Unsplit(self._tree_panel)
+            splitter.SetMinimumPaneSize(0)
+        splitter.Layout()
+        if self._directory_tree_visible:
+            self._flush_deferred_browser_ui()
+
+    def _on_browser_splitter_changing(self, event: wx.SplitterEvent) -> None:
+        sash = self._clamp_browser_splitter_sash(event.GetSashPosition())
+        if sash != event.GetSashPosition():
+            event.SetSashPosition(sash)
+        event.Skip()
+
+    def _on_browser_splitter_changed(self, event: wx.SplitterEvent) -> None:
+        if self._browser_splitter.IsSplit():
+            sash = self._browser_splitter.GetSashPosition()
+            if sash > 0:
+                self._splitter_browser_pos = sash
+        event.Skip()
 
     def _apply_directory_tree_visibility(
         self,
@@ -1564,7 +1661,8 @@ class Wav2ChatFrame(wx.Frame):
     def _refresh_workspace_layout(self) -> None:
         self._main_splitter.Layout()
         self._content_wrap.Layout()
-        self._workspace_sizer.Layout()
+        if hasattr(self, "_browser_splitter"):
+            self._browser_splitter.Layout()
         self._work_panel.Layout()
         self._splitter_main.Layout()
         parent = self._main_splitter.GetParent()
@@ -1655,8 +1753,12 @@ class Wav2ChatFrame(wx.Frame):
             return
         if not directory.is_dir():
             return
-        self._init_directory_tree()
-        self._select_tree_directory(directory)
+        if self._directory_tree_ui_active():
+            self._init_directory_tree()
+            self._select_tree_directory(directory)
+        else:
+            self._tree_needs_init = True
+            self._pending_tree_directory = directory
         self._load_directory_files(directory)
 
     def _select_tree_directory(self, directory: Path) -> None:
@@ -1666,6 +1768,9 @@ class Wav2ChatFrame(wx.Frame):
             return
         if not directory.is_dir():
             directory = directory.parent
+        if not self._directory_tree_ui_active():
+            self._pending_tree_directory = directory
+            return
         item = self._ensure_tree_item(directory)
         if item is None or not item.IsOk():
             return
@@ -1751,6 +1856,14 @@ class Wav2ChatFrame(wx.Frame):
         self._spin_min_speakers.BindValueChanged(self._on_min_speakers_changed)
         self._spin_max_speakers.BindValueChanged(self._on_max_speakers_changed)
         self._main_splitter.Bind(wx.EVT_SPLITTER_SASH_POS_CHANGED, self._on_log_splitter_changed)
+        self._browser_splitter.Bind(
+            wx.EVT_SPLITTER_SASH_POS_CHANGING,
+            self._on_browser_splitter_changing,
+        )
+        self._browser_splitter.Bind(
+            wx.EVT_SPLITTER_SASH_POS_CHANGED,
+            self._on_browser_splitter_changed,
+        )
         self._splitter_main.Bind(wx.EVT_SPLITTER_SASH_POS_CHANGING, self._on_splitter_main_changing)
         self._splitter_main.Bind(wx.EVT_SPLITTER_SASH_POS_CHANGED, self._on_splitter_main_changed)
         self._file_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_file_selected)
@@ -1812,6 +1925,15 @@ class Wav2ChatFrame(wx.Frame):
             clamped = self._clamp_file_splitter_sash(sash)
             if clamped != sash:
                 self._splitter_main.SetSashPosition(clamped)
+        if (
+            self._directory_tree_visible
+            and hasattr(self, "_browser_splitter")
+            and self._browser_splitter.IsSplit()
+        ):
+            sash = self._browser_splitter.GetSashPosition()
+            clamped = self._clamp_browser_splitter_sash(sash)
+            if clamped != sash:
+                self._browser_splitter.SetSashPosition(clamped)
         event.Skip()
 
     def _set_status(self, key: str, **kwargs: object) -> None:
@@ -1901,8 +2023,7 @@ class Wav2ChatFrame(wx.Frame):
                 if height > 0:
                     sash = self._main_splitter.GetSashPosition()
                     self._log_sash_height = max(LOG_PANEL_MIN_HEIGHT, height - sash)
-                self._main_splitter.Unsplit(self._content_wrap)
-            self._log_wrap.Hide()
+                self._main_splitter.Unsplit(self._log_wrap)
             self._main_splitter.SetMinimumPaneSize(0)
 
         self._content_wrap.Show()
@@ -1979,6 +2100,12 @@ class Wav2ChatFrame(wx.Frame):
         if self._current_directory is not None:
             self._set_breadcrumbs(self._current_directory)
         self._chk_auto_convert.SetLabel(t("button.auto_convert"))
+        if hasattr(self, "_btn_convert"):
+            self._btn_convert.SetLabel(t("button.convert"))
+            play_bitmap = _play_stock_bitmap()
+            if play_bitmap.IsOk():
+                self._btn_convert.SetBitmap(play_bitmap)
+                self._btn_convert.SetBitmapPosition(wx.LEFT)
         self._label_view.SetLabel(t("label.view"))
         self._rb_list.SetLabel(t("view.list"))
         self._rb_bubbles.SetLabel(t("view.bubbles"))
@@ -3113,7 +3240,12 @@ class Wav2ChatFrame(wx.Frame):
         *,
         restore_selection: set[int] | None = None,
         preserve_search_focus: bool = False,
+        force: bool = False,
     ) -> None:
+        if not force and not self._file_list.IsShown():
+            self._file_list_needs_sync = True
+            return
+        self._file_list_needs_sync = False
         if restore_selection is None:
             restore_selection = set(self._selected_entry_indices())
         self._rebuild_visible_entries()
@@ -3138,6 +3270,9 @@ class Wav2ChatFrame(wx.Frame):
 
     def _update_row_status(self, entry_index: int) -> None:
         if entry_index < 0 or entry_index >= len(self.entries):
+            return
+        if not self._file_list.IsShown():
+            self._file_list_needs_sync = True
             return
         if self._search_keywords:
             selected_entries = set(self._selected_entry_indices())
@@ -3632,7 +3767,7 @@ class Wav2ChatFrame(wx.Frame):
             t("log.start_batch", count=len(pending)),
         )
 
-        self._main_toolbar.EnableTool(self.ID_CONVERT, False)
+        self._sync_convert_controls(False)
         self._spin_min_speakers.Disable()
         self._spin_max_speakers.Disable()
         self._file_menu.Enable(self.ID_REFRESH_MODELS, False)
@@ -3734,7 +3869,10 @@ class Wav2ChatFrame(wx.Frame):
                 if entry and entry.transcript:
                     self._render_transcript(entry)
         elif kind == "sync":
-            self._sync_file_list()
+            if self._file_list.IsShown():
+                self._sync_file_list()
+            else:
+                self._file_list_needs_sync = True
         elif kind == "progress":
             payload_dict = dict(payload)  # type: ignore[arg-type]
             self._report_conversion_progress(
@@ -3782,15 +3920,18 @@ class Wav2ChatFrame(wx.Frame):
         elif kind == "done":
             self._converting_active = False
             self._set_progress(None)
-            self._main_toolbar.EnableTool(self.ID_CONVERT, True)
+            self._sync_convert_controls(True)
             self._spin_min_speakers.Enable()
             self._spin_max_speakers.Enable()
             self._file_menu.Enable(self.ID_REFRESH_MODELS, True)
+            if self._file_list_needs_sync and self._file_list.IsShown():
+                self._file_list_needs_sync = False
+                self._sync_file_list(force=True)
             if self._pending_browser_directory is not None:
                 target = self._pending_browser_directory
                 self._pending_browser_directory = None
-                self._select_tree_directory(target)
                 self._load_directory_files(target)
+                self._select_tree_directory(target)
         return False
 
 
