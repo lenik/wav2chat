@@ -28,6 +28,9 @@ dependencies = [
     "modelscope>=1.9.0",
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
+    # Numba (pulled in by funasr) needs coverage.types.Tracer (>=7.6.1); Debian
+    # system-site-packages venvs often ship coverage 7.6.0, which breaks import.
+    "coverage>=7.6.1",
 ]
 
 # GUI uses wxPython via the system package on Linux (no pip wheels).
