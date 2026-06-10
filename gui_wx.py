@@ -6,13 +6,27 @@ import argparse
 import logging
 import queue
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import wx
 
+from wav2chat.app_settings import (
+    DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_WINDOW_WIDTH,
+    MIN_CONTENT_HEIGHT,
+    load_app_settings,
+    save_app_settings,
+)
 from wav2chat.audio_playback import SegmentPlayer, segment_play_range
+from wav2chat.dialog_utils import bind_dialog_escape_close
 from wav2chat.errors import FunASREmptyResultError, Wav2ChatError
+from wav2chat.fs_browser import (
+    TREE_DUMMY_LABEL,
+    list_subdirectories,
+    path_breadcrumb_segments,
+)
 from wav2chat.filename_meta import entry_timestamp, parse_audio_filename
 from wav2chat.funasr_backend import FunASRBackend
 from wav2chat.i18n import SUPPORTED_LOCALES, set_locale, t
@@ -25,6 +39,9 @@ from wav2chat.pipeline import (
     write_transcript_outputs,
 )
 from wav2chat.render import display_name, format_timestamp
+from wav2chat.phone_import import PhoneImportResult
+from wav2chat.phone_import_dialog import PhoneImportDialog
+from wav2chat.settings_dialog import SettingsDialog
 from wav2chat.speaker_ui import RoundedAvatarPanel, SpeakerProfileDialog
 
 AUDIO_WILDCARD = "*.wav;*.mp3;*.m4a;*.amr;*.aac;*.flac;*.ogg"
@@ -35,17 +52,27 @@ IMG_CONVERTED = 1
 IMG_EMPTY = 2
 IMG_ERROR = 3
 IMG_CONVERTING = 4
+IMG_WARNING = 5
+IMG_SESSION_ONLY = 6
 STATUS_DOT_RGB = {
     IMG_UNCONVERTED: (198, 40, 40),
     IMG_CONVERTED: (46, 125, 50),
     IMG_EMPTY: (173, 216, 230),
     IMG_ERROR: (198, 40, 40),
     IMG_CONVERTING: (21, 101, 192),
+    IMG_SESSION_ONLY: (255, 255, 255),
 }
 STATUS_ICON_SIZE = 14
 PANEL_PADDING = 10
+SPLITTER_GUTTER = 8
+TOOLBAR_BITMAP_MEDIUM = 24
+TOOLBAR_BITMAP_LARGE = 32
 LOG_PANEL_DEFAULT_HEIGHT = 120
 LOG_PANEL_MIN_HEIGHT = 48
+FILE_PANEL_DEFAULT_WIDTH = 320
+MIN_FILE_PANEL_WIDTH = 100
+MIN_TREE_PANEL_WIDTH = 120
+MIN_CHAT_PANEL_WIDTH = 420
 STATUS_PROGRESS_WIDTH = 140
 NAME_COL = 0
 STATUS_COL = 1
@@ -157,12 +184,188 @@ def _apply_ui_font(window: wx.Window, font: wx.Font) -> None:
         _apply_ui_font(child, font)
 
 
+class _FlatLinkButton(wx.Panel):
+    """Flat breadcrumb segment with hover border."""
+
+    def __init__(self, parent: wx.Window, label: str) -> None:
+        super().__init__(parent, style=wx.BORDER_NONE)
+        self._hover = False
+        self._active = False
+        self._enabled = True
+        self._border = wx.SystemSettings.GetColour(wx.SYS_COLOUR_BTNSHADOW)
+        self._label = wx.StaticText(self, label=label)
+        sizer = wx.BoxSizer(wx.HORIZONTAL)
+        sizer.Add(self._label, 0, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 4)
+        self.SetSizer(sizer)
+        self.SetToolTip(label)
+        self._apply_colours()
+        self._click_handler: Callable[[], None] | None = None
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        for target in (self, self._label):
+            target.Bind(wx.EVT_ENTER_WINDOW, self._on_enter)
+            target.Bind(wx.EVT_LEAVE_WINDOW, self._on_leave)
+            target.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+            target.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+
+    def SetLabel(self, label: str) -> None:
+        self._label.SetLabel(label)
+        self.SetToolTip(label)
+
+    def GetLabel(self) -> str:
+        return self._label.GetLabel()
+
+    def BindClick(self, handler: Callable[[], None]) -> None:
+        self._click_handler = handler
+
+    def SetActive(self, active: bool) -> None:
+        self._active = active
+        self.Refresh()
+
+    def Enable(self, enable: bool = True) -> None:
+        self._enabled = enable
+        colour = wx.SystemSettings.GetColour(
+            wx.SYS_COLOUR_GRAYTEXT if not enable else wx.SYS_COLOUR_WINDOWTEXT
+        )
+        self._label.SetForegroundColour(colour)
+        if not enable:
+            self._hover = False
+        self._apply_colours()
+        self.Refresh()
+        super().Enable(enable)
+
+    def _apply_colours(self) -> None:
+        bg = self.GetParent().GetBackgroundColour()
+        self.SetBackgroundColour(bg)
+        self._label.SetBackgroundColour(bg)
+
+    def _on_paint(self, event: wx.PaintEvent) -> None:
+        if not self._enabled or not (self._hover or self._active):
+            event.Skip()
+            return
+        dc = wx.PaintDC(self)
+        width, height = self.GetSize()
+        dc.SetPen(wx.Pen(self._border, 1))
+        dc.SetBrush(wx.TRANSPARENT_BRUSH)
+        dc.DrawRectangle(0, 0, width - 1, height - 1)
+        event.Skip()
+
+    def _on_enter(self, _event: wx.Event) -> None:
+        if not self._enabled:
+            return
+        self._hover = True
+        self.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        self.Refresh()
+
+    def _on_leave(self, _event: wx.Event) -> None:
+        self._hover = False
+        self.SetCursor(wx.NullCursor)
+        self.Refresh()
+
+    def _on_left_down(self, event: wx.MouseEvent) -> None:
+        if not self._enabled:
+            return
+        if not self.HasCapture():
+            self.CaptureMouse()
+        event.Skip()
+
+    def _on_left_up(self, event: wx.MouseEvent) -> None:
+        if self.HasCapture():
+            self.ReleaseMouse()
+        if not self._enabled:
+            return
+        rect = self.GetClientRect()
+        if self._hover and rect.Contains(event.GetPosition()) and self._click_handler is not None:
+            self._click_handler()
+        event.Skip()
+
+
+class _IntSpinRow(wx.Panel):
+    """Compact integer field; Up/Down keys adjust the value (no spin buttons)."""
+
+    def __init__(
+        self,
+        parent: wx.Window,
+        value: int,
+        *,
+        min_value: int = 1,
+        max_value: int = 99,
+    ) -> None:
+        super().__init__(parent)
+        self._min_value = min_value
+        self._max_value = max_value
+        self._value = self._clamp(value)
+        self._change_handler: Callable[[], None] | None = None
+        self._text = wx.TextCtrl(
+            self,
+            value=str(self._value),
+            style=wx.TE_CENTRE | wx.TE_PROCESS_ENTER,
+            size=wx.Size(44, -1),
+        )
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(self._text, 0, wx.ALIGN_CENTER_VERTICAL)
+        self.SetSizer(row)
+        self._text.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
+        self._text.Bind(wx.EVT_KILL_FOCUS, self._on_text_done)
+        self._text.Bind(wx.EVT_TEXT_ENTER, self._on_text_done)
+
+    def BindValueChanged(self, handler: Callable[[], None]) -> None:
+        self._change_handler = handler
+
+    def _clamp(self, value: int) -> int:
+        return max(self._min_value, min(self._max_value, value))
+
+    def GetValue(self) -> int:
+        return self._value
+
+    def SetValue(self, value: int) -> None:
+        self._value = self._clamp(value)
+        self._text.SetValue(str(self._value))
+
+    def _notify_change(self) -> None:
+        if self._change_handler is not None:
+            self._change_handler()
+
+    def _on_key_down(self, event: wx.KeyEvent) -> None:
+        key = event.GetKeyCode()
+        if key == wx.WXK_UP:
+            self.SetValue(self._value + 1)
+            self._notify_change()
+            return
+        if key == wx.WXK_DOWN:
+            self.SetValue(self._value - 1)
+            self._notify_change()
+            return
+        event.Skip()
+
+    def _on_text_done(self, event: wx.Event) -> None:
+        try:
+            value = int(self._text.GetValue().strip())
+        except ValueError:
+            value = self._value
+        previous = self._value
+        self.SetValue(value)
+        if self._value != previous:
+            self._notify_change()
+        event.Skip()
+
+    def Disable(self) -> bool:
+        self._text.Disable()
+        return super().Disable()
+
+    def Enable(self, enable: bool = True) -> bool:
+        self._text.Enable(enable)
+        return super().Enable(enable)
+
+
 @dataclass
 class FileEntry:
     path: Path
     status: str = "unconverted"
     transcript: Transcript | None = None
     error: str | None = None
+    has_audio: bool = True
+    session_only: bool = False
+    json_invalid: bool = False
 
 
 @dataclass
@@ -176,6 +379,7 @@ class GuiSettings:
     keep_temp: bool = False
     verbose: bool = False
     quiet: bool = False
+    refresh_models: bool = False
 
 
 def _parse_search_keywords(query: str) -> list[str]:
@@ -216,7 +420,7 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _entry_label(path: Path) -> str:
-    return parse_audio_filename(path).title
+    return path.name
 
 
 def _entry_title(path: Path) -> str:
@@ -224,8 +428,54 @@ def _entry_title(path: Path) -> str:
 
 
 def _entry_meta(path: Path, duration: float | None) -> str:
-    timestamp = entry_timestamp(path).strftime("%Y-%m-%d %H:%M")
+    parsed = parse_audio_filename(path)
+    if parsed.recorded_at is not None:
+        timestamp = parsed.recorded_at.strftime("%Y-%m-%d %H:%M")
+    else:
+        timestamp = entry_timestamp(path).strftime("%Y-%m-%d %H:%M")
     return f"{timestamp}  {t('meta.duration', duration=_format_duration(duration))}"
+
+
+def _try_load_transcript_json(path: Path) -> Transcript | None:
+    try:
+        return Transcript.load_json(path)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _find_audio_for_stem(stem_path: Path) -> Path | None:
+    for ext in SUPPORTED_EXTENSIONS:
+        candidate = stem_path.with_suffix(ext)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _entry_has_playable_audio(entry: FileEntry) -> bool:
+    return entry.has_audio and entry.path.is_file() and is_supported_audio(entry.path)
+
+
+def _entry_json_path(entry: FileEntry) -> Path:
+    if entry.session_only:
+        return entry.path
+    return default_json_path(entry.path)
+
+
+def _list_directory_paths(directory: Path) -> list[Path]:
+    try:
+        items = sorted(directory.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    audio_paths = [path for path in items if is_supported_audio(path)]
+    json_paths = [
+        path for path in items if path.is_file() and path.suffix.lower() == ".json"
+    ]
+    audio_stems = {path.stem for path in audio_paths}
+    combined = list(audio_paths)
+    for json_path in json_paths:
+        if json_path.stem not in audio_stems:
+            combined.append(json_path)
+    return sorted(combined, key=lambda p: p.name.lower())
 
 
 def _transcript_is_empty(transcript: Transcript | None) -> bool:
@@ -234,7 +484,12 @@ def _transcript_is_empty(transcript: Transcript | None) -> bool:
     return not any(segment.text.strip() for segment in transcript.segments)
 
 
-def _create_dot_bitmap(colour: wx.Colour, size: int = STATUS_ICON_SIZE) -> wx.Bitmap:
+def _create_dot_bitmap(
+    colour: wx.Colour,
+    size: int = STATUS_ICON_SIZE,
+    *,
+    outline: bool = False,
+) -> wx.Bitmap:
     bg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
     image = wx.Image(size, size)
     if not image.IsOk():
@@ -245,9 +500,39 @@ def _create_dot_bitmap(colour: wx.Colour, size: int = STATUS_ICON_SIZE) -> wx.Bi
     bitmap = wx.Bitmap(image)
     dc = wx.MemoryDC(bitmap)
     dc.SetBrush(wx.Brush(colour))
-    dc.SetPen(wx.Pen(colour))
+    if outline:
+        dc.SetPen(wx.Pen(wx.Colour(160, 160, 160)))
+    else:
+        dc.SetPen(wx.Pen(colour))
     radius = max(2, size // 2 - 2)
     dc.DrawCircle(size // 2, size // 2, radius)
+    dc.SelectObject(wx.NullBitmap)
+    return bitmap
+
+
+def _create_warning_bitmap(size: int = STATUS_ICON_SIZE) -> wx.Bitmap:
+    bg = wx.SystemSettings.GetColour(wx.SYS_COLOUR_WINDOW)
+    image = wx.Image(size, size)
+    if not image.IsOk():
+        return wx.Bitmap(size, size)
+    for y in range(size):
+        for x in range(size):
+            image.SetRGB(x, y, bg.Red(), bg.Green(), bg.Blue())
+    bitmap = wx.Bitmap(image)
+    dc = wx.MemoryDC(bitmap)
+    gc = wx.GraphicsContext.Create(dc)
+    if gc is not None:
+        path = gc.CreatePath()
+        path.MoveToPoint(size / 2, 2)
+        path.AddLineToPoint(size - 2, size - 2)
+        path.AddLineToPoint(2, size - 2)
+        path.CloseSubpath()
+        gc.SetBrush(wx.Brush(wx.Colour(255, 193, 7)))
+        gc.SetPen(wx.Pen(wx.Colour(230, 140, 0)))
+        gc.FillPath(path)
+        font = wx.Font(max(7, size - 7), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+        gc.SetFont(font, wx.Colour(40, 40, 40))
+        gc.DrawText("!", size / 2 - 3, size / 2 - 6)
     dc.SelectObject(wx.NullBitmap)
     return bitmap
 
@@ -259,10 +544,17 @@ def _build_status_image_list() -> wx.ImageList:
         red, green, blue = STATUS_DOT_RGB[index]
         bitmap = _create_dot_bitmap(wx.Colour(red, green, blue))
         images.Add(bitmap, mask)
+    images.Add(_create_warning_bitmap(), mask)
+    white = STATUS_DOT_RGB[IMG_SESSION_ONLY]
+    images.Add(_create_dot_bitmap(wx.Colour(*white), outline=True), mask)
     return images
 
 
 def _status_image_index(entry: FileEntry) -> int:
+    if entry.json_invalid:
+        return IMG_WARNING
+    if entry.session_only:
+        return IMG_SESSION_ONLY
     if entry.status == "converted":
         if _transcript_is_empty(entry.transcript):
             return IMG_EMPTY
@@ -342,6 +634,7 @@ class _ImportDialog(wx.Dialog):
         sizer.Add(self._gauge, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 12)
         self.SetSizer(sizer)
         self.Fit()
+        bind_dialog_escape_close(self)
         self.CentreOnParent()
 
     def set_message(self, message: str) -> None:
@@ -368,10 +661,19 @@ class _ImportDialog(wx.Dialog):
 
 
 class Wav2ChatFrame(wx.Frame):
-    ID_OPEN_WAVEFORM = wx.NewIdRef()
+    ID_OPEN_DIRECTORY = wx.NewIdRef()
     ID_OPEN_SESSION = wx.NewIdRef()
+    ID_IMPORT_PHONE = wx.NewIdRef()
+    ID_REFRESH_MODELS = wx.NewIdRef()
+    ID_REFRESH_BROWSER = wx.NewIdRef()
     ID_EXIT = wx.NewIdRef()
+    ID_SETTINGS = wx.NewIdRef()
+    ID_SHOW_DIRECTORY = wx.NewIdRef()
+    ID_SHOW_LOG = wx.NewIdRef()
     ID_CONVERT = wx.NewIdRef()
+    ID_LARGE_TOOLS = wx.NewIdRef()
+    ID_SHOW_TOOL_LABELS = wx.NewIdRef()
+    ID_SHOW_TOOLBAR = wx.NewIdRef()
 
     def __init__(
         self,
@@ -380,11 +682,25 @@ class Wav2ChatFrame(wx.Frame):
     ) -> None:
         set_locale(settings.ui_lang)
 
-        super().__init__(None, title=t("app.window_title"), size=wx.Size(980, 640))
+        app_settings = load_app_settings()
+        super().__init__(
+            None,
+            title=t("app.window_title"),
+            size=wx.Size(
+                app_settings.window_width or DEFAULT_WINDOW_WIDTH,
+                app_settings.window_height or DEFAULT_WINDOW_HEIGHT,
+            ),
+        )
         self.settings = settings
+        self.app_settings = app_settings
+        if not settings.refresh_models:
+            settings.refresh_models = self.app_settings.refresh_models
 
         self.entries: list[FileEntry] = []
         self.focus_index: int | None = None
+        self._current_directory: Path | None = None
+        self._tree_root_item: wx.TreeItemId | None = None
+        self._tree_selecting = False
         self.view_mode = "bubbles"
         self._status_key = "status.ready"
         self._status_kwargs: dict[str, object] = {}
@@ -394,6 +710,8 @@ class Wav2ChatFrame(wx.Frame):
         self._import_dialog: _ImportDialog | None = None
         self._import_active = False
         self._import_added_indices: list[int] = []
+        self._phone_import_dialog: PhoneImportDialog | None = None
+        self._pending_browser_directory: Path | None = None
         self._stop_convert = threading.Event()
         self._ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._status_images = _build_status_image_list()
@@ -412,18 +730,23 @@ class Wav2ChatFrame(wx.Frame):
         self._selection_explicit_empty = False
         self._suppress_file_select = False
         self._converting_active = False
+        self._last_progress_log_phase: str | None = None
+        self._last_progress_log_percent: int | None = None
         self._render_in_progress = False
         self._render_state: dict | None = None
         self._log_handler: _GuiLogHandler | None = None
-        self._log_sash_height = LOG_PANEL_DEFAULT_HEIGHT
+        self._log_sash_height = self.app_settings.log_sash_height or LOG_PANEL_DEFAULT_HEIGHT
         self._log_panel_visible = True
+        self._directory_tree_visible = True
+        self._toolbar_visible = self.app_settings.toolbar_visible
+        self._splitter_browser_pos = self.app_settings.splitter_browser_pos or 240
+        self._splitter_file_pos = self.app_settings.splitter_main_pos or FILE_PANEL_DEFAULT_WIDTH
         self._avatar_panels: dict[int, RoundedAvatarPanel] = {}
 
         self._build_ui()
         self._setup_ui_fonts()
         self._setup_logging()
         self._bind_events()
-        self.Centre()
 
         self._queue_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_queue_timer, self._queue_timer)
@@ -438,8 +761,13 @@ class Wav2ChatFrame(wx.Frame):
         self._render_chunk_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_render_chunk_timer, self._render_chunk_timer)
 
+        start_dir = self.app_settings.last_browser_directory or Path.home()
         if initial_paths:
-            self._add_paths(initial_paths)
+            first = initial_paths[0].expanduser().resolve()
+            start_dir = first.parent if first.is_file() else first
+        self._select_tree_directory(start_dir)
+        self._load_directory_files(start_dir)
+        wx.CallAfter(self._restore_layout)
 
     def _build_ui(self) -> None:
         statusbar = self.CreateStatusBar(2)
@@ -458,29 +786,53 @@ class Wav2ChatFrame(wx.Frame):
 
         self._content_wrap = wx.Panel(self._main_splitter)
         content_sizer = wx.BoxSizer(wx.VERTICAL)
-        splitter = wx.SplitterWindow(self._content_wrap, style=wx.SP_LIVE_UPDATE)
-        left = wx.Panel(splitter)
-        right = wx.Panel(splitter)
-        splitter.SplitVertically(left, right, 360)
-        splitter.SetMinimumPaneSize(300)
 
-        left_sizer = wx.BoxSizer(wx.VERTICAL)
-        self._label_audio_file = wx.StaticText(left, label=t("label.audio_file"))
-        path_row = wx.BoxSizer(wx.HORIZONTAL)
-        self._audio_path = wx.TextCtrl(left, style=wx.TE_READONLY)
-        self._btn_select = wx.Button(left, label=t("button.select"))
-        path_row.Add(self._audio_path, 1, wx.EXPAND | wx.RIGHT, 8)
-        path_row.Add(self._btn_select, 0)
+        self._breadcrumb_bar = wx.Panel(self._content_wrap)
+        breadcrumb_sizer = wx.BoxSizer(wx.VERTICAL)
+        breadcrumb_sizer.Add(self._build_main_toolbar(self._breadcrumb_bar), 0, wx.EXPAND | wx.BOTTOM, 4)
+        breadcrumb_row = wx.BoxSizer(wx.HORIZONTAL)
+        breadcrumb_row.Add(self._build_home_nav_button(self._breadcrumb_bar), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self._breadcrumb_panel = wx.Panel(self._breadcrumb_bar, style=wx.BORDER_NONE)
+        self._breadcrumb_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self._breadcrumb_panel.SetSizer(self._breadcrumb_sizer)
+        breadcrumb_row.Add(self._breadcrumb_panel, 1, wx.EXPAND)
+        breadcrumb_sizer.Add(breadcrumb_row, 0, wx.EXPAND)
+        self._breadcrumb_bar.SetSizer(breadcrumb_sizer)
+        self._apply_breadcrumb_nav_colours()
 
-        self._label_files = wx.StaticText(left, label=t("label.files"))
-        self._search_box = wx.TextCtrl(left, style=wx.TE_PROCESS_ENTER)
+        self._workspace_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self._tree_panel = wx.Panel(self._content_wrap)
+        self._work_panel = wx.Panel(self._content_wrap)
+
+        splitter_main = wx.SplitterWindow(self._work_panel, style=wx.SP_LIVE_UPDATE)
+        self._file_panel = wx.Panel(splitter_main)
+        chat_panel = wx.Panel(splitter_main)
+        splitter_main.SplitVertically(
+            self._file_panel,
+            chat_panel,
+            self._splitter_file_pos,
+        )
+        splitter_main.SetMinimumPaneSize(MIN_FILE_PANEL_WIDTH)
+        splitter_main.SetSashGravity(0.0)
+
+        tree_sizer = wx.BoxSizer(wx.VERTICAL)
+        self._dir_tree = wx.TreeCtrl(
+            self._tree_panel,
+            style=wx.TR_DEFAULT_STYLE | wx.TR_LINES_AT_ROOT | wx.BORDER_SUNKEN,
+        )
+        tree_sizer.Add(self._dir_tree, 1, wx.EXPAND)
+        self._tree_panel.SetSizer(tree_sizer)
+
+        file_sizer = wx.BoxSizer(wx.VERTICAL)
+        self._label_files = wx.StaticText(self._file_panel, label=t("label.files"))
+        self._search_box = wx.TextCtrl(self._file_panel, style=wx.TE_PROCESS_ENTER)
         try:
             self._search_box.SetHint(t("hint.search"))
         except AttributeError:
             pass
 
         self._file_list = wx.ListCtrl(
-            left,
+            self._file_panel,
             style=wx.LC_REPORT | wx.BORDER_SUNKEN,
         )
         self._file_list.SetWindowStyleFlag(
@@ -500,31 +852,50 @@ class Wav2ChatFrame(wx.Frame):
             width=STATUS_COL_WIDTH,
         )
 
-        control_row = wx.BoxSizer(wx.HORIZONTAL)
-        self._btn_convert = wx.Button(left, label=t("button.convert"))
-        self._chk_auto_convert = wx.CheckBox(left, label=t("button.auto_convert"))
-        self._chk_show_log = wx.CheckBox(left, label=t("button.show_log"))
-        self._chk_show_log.SetValue(True)
-        control_row.Add(self._btn_convert, 0, wx.RIGHT, 12)
-        control_row.Add(self._chk_auto_convert, 0, wx.RIGHT, 12)
-        control_row.Add(self._chk_show_log, 0)
+        min_speakers, max_speakers = self._speaker_count_defaults()
+        speaker_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._label_speaker_count = wx.StaticText(self._file_panel, label=t("label.speaker_count"))
+        self._spin_min_speakers = _IntSpinRow(self._file_panel, min_speakers)
+        self._label_speaker_to = wx.StaticText(self._file_panel, label=t("label.speaker_count_to"))
+        self._spin_max_speakers = _IntSpinRow(self._file_panel, max_speakers)
+        self._label_speaker_unit = wx.StaticText(self._file_panel, label=t("label.speaker_count_unit"))
+        speaker_row.Add(self._label_speaker_count, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        speaker_row.Add(self._spin_min_speakers, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        speaker_row.Add(self._label_speaker_to, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        speaker_row.Add(self._spin_max_speakers, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        speaker_row.Add(self._label_speaker_unit, 0, wx.ALIGN_CENTER_VERTICAL)
 
-        left_sizer.Add(self._label_audio_file, 0, wx.BOTTOM, 4)
-        left_sizer.Add(path_row, 0, wx.EXPAND | wx.BOTTOM, 8)
-        left_sizer.Add(self._label_files, 0, wx.BOTTOM, 4)
-        left_sizer.Add(self._search_box, 0, wx.EXPAND | wx.BOTTOM, 4)
-        left_sizer.Add(self._file_list, 1, wx.EXPAND | wx.BOTTOM, 8)
-        left_sizer.Add(control_row, 0)
-        left.SetSizer(left_sizer)
+        control_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._chk_auto_convert = wx.CheckBox(self._file_panel, label=t("button.auto_convert"))
+        control_row.AddStretchSpacer(1)
+        control_row.Add(self._chk_auto_convert, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        file_sizer.Add(self._label_files, 0, wx.BOTTOM, 4)
+        file_sizer.Add(self._search_box, 0, wx.EXPAND | wx.BOTTOM, 4)
+        file_sizer.Add(self._file_list, 1, wx.EXPAND | wx.BOTTOM, 8)
+        file_sizer.Add(speaker_row, 0, wx.EXPAND | wx.BOTTOM, 6)
+        file_sizer.Add(control_row, 0, wx.EXPAND)
+        file_outer = wx.BoxSizer(wx.HORIZONTAL)
+        file_outer.Add(file_sizer, 1, wx.EXPAND | wx.RIGHT, SPLITTER_GUTTER)
+        self._file_panel.SetSizer(file_outer)
+
+        work_sizer = wx.BoxSizer(wx.VERTICAL)
+        work_sizer.Add(splitter_main, 1, wx.EXPAND)
+        self._work_panel.SetSizer(work_sizer)
+
+        self._workspace_sizer.Add(self._tree_panel, 0, wx.EXPAND | wx.RIGHT, SPLITTER_GUTTER)
+        self._workspace_sizer.Add(self._work_panel, 1, wx.EXPAND | wx.LEFT, SPLITTER_GUTTER)
+
+        self._init_directory_tree()
 
         right_sizer = wx.BoxSizer(wx.VERTICAL)
         header = wx.BoxSizer(wx.HORIZONTAL)
-        self._title_label = wx.StaticText(right, label=t("status.no_session"))
+        self._title_label = wx.StaticText(chat_panel, label=t("status.no_session"))
 
         view_row = wx.BoxSizer(wx.HORIZONTAL)
-        self._label_view = wx.StaticText(right, label=t("label.view"))
-        self._rb_list = wx.RadioButton(right, label=t("view.list"), style=wx.RB_GROUP)
-        self._rb_bubbles = wx.RadioButton(right, label=t("view.bubbles"))
+        self._label_view = wx.StaticText(chat_panel, label=t("label.view"))
+        self._rb_list = wx.RadioButton(chat_panel, label=t("view.list"), style=wx.RB_GROUP)
+        self._rb_bubbles = wx.RadioButton(chat_panel, label=t("view.bubbles"))
         self._rb_bubbles.SetValue(True)
         view_row.Add(self._label_view, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
         view_row.Add(self._rb_bubbles, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
@@ -532,12 +903,12 @@ class Wav2ChatFrame(wx.Frame):
         header.Add(self._title_label, 1, wx.ALIGN_CENTER_VERTICAL)
         header.Add(view_row, 0, wx.ALIGN_CENTER_VERTICAL)
 
-        self._meta_label = wx.StaticText(right, label=t("status.select_or_convert"))
-        self._list_panel = wx.ScrolledWindow(right, style=wx.VSCROLL | wx.BORDER_NONE)
+        self._meta_label = wx.StaticText(chat_panel, label=t("status.select_or_convert"))
+        self._list_panel = wx.ScrolledWindow(chat_panel, style=wx.VSCROLL | wx.BORDER_NONE)
         self._list_panel.SetScrollRate(0, 10)
         self._list_sizer = wx.BoxSizer(wx.VERTICAL)
         self._list_panel.SetSizer(self._list_sizer)
-        self._bubble_panel = wx.ScrolledWindow(right, style=wx.VSCROLL | wx.BORDER_NONE)
+        self._bubble_panel = wx.ScrolledWindow(chat_panel, style=wx.VSCROLL | wx.BORDER_NONE)
         self._bubble_panel.SetBackgroundColour(_rgb_colour(*CHAT_BG_RGB))
         self._bubble_panel.SetScrollRate(0, 10)
         self._bubble_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -548,19 +919,22 @@ class Wav2ChatFrame(wx.Frame):
         right_sizer.Add(self._meta_label, 0, wx.EXPAND | wx.BOTTOM, 8)
         right_sizer.Add(self._list_panel, 1, wx.EXPAND)
         right_sizer.Add(self._bubble_panel, 1, wx.EXPAND)
-        right.SetSizer(right_sizer)
+        chat_outer = wx.BoxSizer(wx.HORIZONTAL)
+        chat_outer.Add(right_sizer, 1, wx.EXPAND | wx.LEFT, SPLITTER_GUTTER)
+        chat_panel.SetSizer(chat_outer)
 
-        content_sizer.Add(splitter, 1, wx.EXPAND)
+        content_sizer.Add(self._breadcrumb_bar, 0, wx.EXPAND | wx.BOTTOM, 4)
+        content_sizer.Add(self._workspace_sizer, 1, wx.EXPAND)
         self._content_wrap.SetSizer(content_sizer)
+        self._splitter_main = splitter_main
+        self._chat_panel = chat_panel
 
         self._log_wrap = wx.Panel(self._main_splitter)
         log_sizer = wx.BoxSizer(wx.VERTICAL)
-        self._label_log = wx.StaticText(self._log_wrap, label=t("label.log"))
         self._log_panel = wx.TextCtrl(
             self._log_wrap,
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP,
         )
-        log_sizer.Add(self._label_log, 0, wx.BOTTOM, 4)
         log_sizer.Add(self._log_panel, 1, wx.EXPAND)
         self._log_wrap.SetSizer(log_sizer)
 
@@ -576,6 +950,7 @@ class Wav2ChatFrame(wx.Frame):
         self._build_menubar()
         self._register_drop_targets()
         self._resize_file_list_columns()
+        self._sync_tree_column_width()
 
     def _setup_ui_fonts(self) -> None:
         self._ui_font = _pick_unicode_font()
@@ -648,10 +1023,32 @@ class Wav2ChatFrame(wx.Frame):
     def _build_menubar(self) -> None:
         menubar = wx.MenuBar()
         file_menu = wx.Menu()
-        file_menu.Append(self.ID_OPEN_WAVEFORM, t("menu.open_waveform"))
+        file_menu.Append(self.ID_OPEN_DIRECTORY, t("menu.open_directory"))
         file_menu.Append(self.ID_OPEN_SESSION, t("menu.open_chat_session"))
+        file_menu.Append(self.ID_IMPORT_PHONE, t("menu.import_from_phone"))
+        file_menu.AppendSeparator()
+        file_menu.AppendCheckItem(self.ID_REFRESH_MODELS, t("menu.refresh_models"))
+        file_menu.Check(self.ID_REFRESH_MODELS, self.settings.refresh_models)
         file_menu.AppendSeparator()
         file_menu.Append(self.ID_EXIT, t("menu.exit") + "\tCtrl+Q")
+
+        edit_menu = wx.Menu()
+        edit_menu.Append(self.ID_SETTINGS, t("menu.settings"))
+
+        view_menu = wx.Menu()
+        view_menu.Append(self.ID_REFRESH_BROWSER, t("menu.refresh_browser"))
+        view_menu.AppendSeparator()
+        view_menu.AppendCheckItem(self.ID_SHOW_DIRECTORY, t("menu.show_directory"))
+        view_menu.AppendCheckItem(self.ID_SHOW_LOG, t("menu.show_loggings"))
+        view_menu.AppendSeparator()
+        view_menu.AppendCheckItem(self.ID_SHOW_TOOLBAR, t("menu.show_toolbar"))
+        view_menu.AppendCheckItem(self.ID_LARGE_TOOLS, t("menu.large_tools"))
+        view_menu.AppendCheckItem(self.ID_SHOW_TOOL_LABELS, t("menu.show_tool_labels"))
+        view_menu.Check(self.ID_SHOW_DIRECTORY, self._directory_tree_visible)
+        view_menu.Check(self.ID_SHOW_LOG, self._log_panel_visible)
+        view_menu.Check(self.ID_SHOW_TOOLBAR, self._toolbar_visible)
+        view_menu.Check(self.ID_LARGE_TOOLS, self.app_settings.large_tools)
+        view_menu.Check(self.ID_SHOW_TOOL_LABELS, self.app_settings.show_tool_labels)
 
         lang_menu = wx.Menu()
         self._lang_menu_ids: dict[str, int] = {}
@@ -661,21 +1058,654 @@ class Wav2ChatFrame(wx.Frame):
             lang_menu.Append(item_id, t(f"lang.{code}"))
 
         menubar.Append(file_menu, t("menu.file"))
+        menubar.Append(edit_menu, t("menu.edit"))
+        menubar.Append(view_menu, t("menu.view"))
         menubar.Append(lang_menu, t("menu.language"))
         self.SetMenuBar(menubar)
         self._file_menu = file_menu
+        self._edit_menu = edit_menu
+        self._view_menu = view_menu
         self._lang_menu = lang_menu
 
     def _register_drop_targets(self) -> None:
         drop = _PathDropTarget(self._import_dropped_paths)
         self.SetDropTarget(drop)
-        self._audio_path.SetDropTarget(_PathDropTarget(self._import_dropped_paths))
         self._file_list.SetDropTarget(_PathDropTarget(self._import_dropped_paths))
 
+    def _init_directory_tree(self) -> None:
+        self._dir_tree.DeleteAllItems()
+        root_path = Path("/")
+        root = self._dir_tree.AddRoot("/")
+        self._dir_tree.SetItemData(root, root_path)
+        self._tree_root_item = root
+        if list_subdirectories(root_path):
+            placeholder = self._dir_tree.AppendItem(root, TREE_DUMMY_LABEL)
+            self._dir_tree.SetItemData(placeholder, None)
+
+    def _tree_append_dir_node(self, parent: wx.TreeItemId, path: Path) -> wx.TreeItemId:
+        label = path.name or str(path)
+        item = self._dir_tree.AppendItem(parent, label)
+        self._dir_tree.SetItemData(item, path)
+        if list_subdirectories(path):
+            placeholder = self._dir_tree.AppendItem(item, TREE_DUMMY_LABEL)
+            self._dir_tree.SetItemData(placeholder, None)
+        return item
+
+    def _tree_find_child(self, parent: wx.TreeItemId, path: Path) -> wx.TreeItemId | None:
+        try:
+            target = path.resolve()
+        except OSError:
+            target = path
+        child, cookie = self._dir_tree.GetFirstChild(parent)
+        while child.IsOk():
+            data = self._dir_tree.GetItemData(child)
+            if isinstance(data, Path):
+                try:
+                    if data.resolve() == target:
+                        return child
+                except OSError:
+                    if data == path:
+                        return child
+            child, cookie = self._dir_tree.GetNextChild(parent, cookie)
+        return None
+
+    def _tree_populate_children(self, item: wx.TreeItemId, path: Path) -> None:
+        if not self._dir_tree.ItemHasChildren(item):
+            return
+        first, _cookie = self._dir_tree.GetFirstChild(item)
+        if first.IsOk() and self._dir_tree.GetItemText(first) == TREE_DUMMY_LABEL:
+            self._dir_tree.DeleteChildren(item)
+            for child_path in list_subdirectories(path):
+                self._tree_append_dir_node(item, child_path)
+
+    def _on_dir_tree_expanding(self, event: wx.TreeEvent) -> None:
+        item = event.GetItem()
+        data = self._dir_tree.GetItemData(item)
+        if isinstance(data, Path):
+            self._tree_populate_children(item, data)
+        event.Skip()
+
+    def _on_dir_tree_sel_changed(self, event: wx.TreeEvent) -> None:
+        if self._tree_selecting:
+            event.Skip()
+            return
+        item = event.GetItem()
+        data = self._dir_tree.GetItemData(item)
+        if isinstance(data, Path) and data.is_dir():
+            self._load_directory_files(data)
+        event.Skip()
+
+    def _set_breadcrumbs(self, directory: Path) -> None:
+        self._breadcrumb_sizer.Clear(delete_windows=True)
+        segments = path_breadcrumb_segments(directory)
+        nav_bg = self._breadcrumb_nav_background()
+        for index, (label, segment_path) in enumerate(segments):
+            if index > 0:
+                separator = wx.StaticText(self._breadcrumb_panel, label=" > ")
+                separator.SetBackgroundColour(nav_bg)
+                self._breadcrumb_sizer.Add(separator, 0, wx.ALIGN_CENTER_VERTICAL)
+            button = _FlatLinkButton(self._breadcrumb_panel, label)
+            button.SetToolTip(str(segment_path))
+            button.BindClick(
+                lambda path=segment_path, btn=button: self._on_breadcrumb_segment(path, btn),
+            )
+            self._breadcrumb_sizer.Add(button, 0, wx.ALIGN_CENTER_VERTICAL)
+        self._apply_breadcrumb_nav_colours()
+        self._breadcrumb_panel.Layout()
+
+    def _breadcrumb_nav_background(self) -> wx.Colour:
+        return self._content_wrap.GetBackgroundColour()
+
+    def _apply_breadcrumb_nav_colours(self) -> None:
+        if not hasattr(self, "_content_wrap"):
+            return
+        bg = self._breadcrumb_nav_background()
+        if hasattr(self, "_breadcrumb_bar"):
+            self._breadcrumb_bar.SetBackgroundColour(bg)
+        if hasattr(self, "_breadcrumb_panel"):
+            self._breadcrumb_panel.SetBackgroundColour(bg)
+        if hasattr(self, "_breadcrumb_sizer"):
+            for index in range(self._breadcrumb_sizer.GetItemCount()):
+                window = self._breadcrumb_sizer.GetItem(index).GetWindow()
+                if isinstance(window, _FlatLinkButton):
+                    window._apply_colours()
+                elif isinstance(window, wx.StaticText):
+                    window.SetBackgroundColour(bg)
+
+    def _on_breadcrumb_segment(
+        self,
+        segment_path: Path,
+        button: _FlatLinkButton,
+    ) -> None:
+        if len(path_breadcrumb_segments(segment_path)) <= 1:
+            self._navigate_from_breadcrumb(segment_path)
+            return
+        parent_dir = segment_path.parent
+        siblings = list_subdirectories(parent_dir)
+        if not siblings:
+            self._navigate_from_breadcrumb(segment_path)
+            return
+
+        menu = wx.Menu()
+        for sibling in siblings:
+            item_id = wx.NewIdRef()
+            item_label = sibling.name
+            if sibling == segment_path:
+                item_label = f"✓ {item_label}"
+            menu.Append(item_id, item_label)
+            self.Bind(
+                wx.EVT_MENU,
+                lambda event, path=sibling: self._navigate_from_breadcrumb(path),
+                id=item_id,
+            )
+
+        pos = button.GetScreenPosition()
+        size = button.GetSize()
+        self._breadcrumb_panel.PopupMenu(
+            menu,
+            self._breadcrumb_panel.ScreenToClient(wx.Point(pos.x, pos.y + size.height)),
+        )
+        menu.Destroy()
+
+    def _navigate_from_breadcrumb(self, directory: Path) -> None:
+        if self._converting_active or self._import_active:
+            return
+        try:
+            directory = directory.expanduser().resolve()
+        except OSError:
+            return
+        if not directory.is_dir():
+            return
+        self._select_tree_directory(directory)
+        self._load_directory_files(directory)
+
+    def _toolbar_bitmap_size(self) -> wx.Size:
+        side = (
+            TOOLBAR_BITMAP_LARGE
+            if self.app_settings.large_tools
+            else TOOLBAR_BITMAP_MEDIUM
+        )
+        return wx.Size(side, side)
+
+    def _toolbar_tool_art(self) -> tuple[tuple[int, str], ...]:
+        return (
+            (self.ID_OPEN_DIRECTORY, wx.ART_FOLDER_OPEN),
+            (self.ID_OPEN_SESSION, wx.ART_FILE_OPEN),
+            (self.ID_IMPORT_PHONE, wx.ART_GO_DOWN),
+            (self.ID_SHOW_DIRECTORY, wx.ART_LIST_VIEW),
+            (self.ID_SHOW_LOG, wx.ART_INFORMATION),
+            (self.ID_CONVERT, wx.ART_EXECUTABLE_FILE),
+        )
+
+    def _home_nav_bitmap_size(self) -> wx.Size:
+        side = 16 if not self.app_settings.large_tools else 20
+        return wx.Size(side, side)
+
+    def _build_home_nav_button(self, parent: wx.Window) -> wx.Button:
+        bitmap = wx.ArtProvider.GetBitmap(
+            wx.ART_GO_HOME,
+            wx.ART_TOOLBAR,
+            self._home_nav_bitmap_size(),
+        )
+        button = wx.Button(parent, label=t("toolbar.home"))
+        if bitmap.IsOk():
+            button.SetBitmap(bitmap)
+        button.Bind(wx.EVT_BUTTON, lambda _event: self._on_toolbar_home())
+        self._home_nav_button = button
+        return button
+
+    def _update_home_nav_button(self) -> None:
+        if not hasattr(self, "_home_nav_button"):
+            return
+        button = self._home_nav_button
+        button.SetLabel(t("toolbar.home"))
+        bitmap = wx.ArtProvider.GetBitmap(
+            wx.ART_GO_HOME,
+            wx.ART_TOOLBAR,
+            self._home_nav_bitmap_size(),
+        )
+        if bitmap.IsOk():
+            button.SetBitmap(bitmap)
+        self._breadcrumb_bar.Layout()
+
+    def _apply_toolbar_size(self) -> None:
+        if not hasattr(self, "_main_toolbar"):
+            return
+        toolbar = self._main_toolbar
+        size = self._toolbar_bitmap_size()
+        toolbar.SetToolBitmapSize(size)
+        for tool_id, art_id in self._toolbar_tool_art():
+            bitmap = wx.ArtProvider.GetBitmap(art_id, wx.ART_TOOLBAR, size)
+            toolbar.SetToolNormalBitmap(tool_id, bitmap)
+        convert_enabled = not self._converting_active
+        toolbar.EnableTool(self.ID_CONVERT, convert_enabled)
+        toolbar.Realize()
+        self._update_home_nav_button()
+        self._breadcrumb_bar.Layout()
+        self.Layout()
+
+    def _toolbar_tool_label(self, key: str) -> str:
+        if self.app_settings.show_tool_labels:
+            return t(key)
+        return ""
+
+    def _build_main_toolbar(self, parent: wx.Window) -> wx.ToolBar:
+        style = wx.TB_FLAT | wx.TB_NODIVIDER
+        if self.app_settings.show_tool_labels:
+            style |= wx.TB_TEXT
+        toolbar = wx.ToolBar(parent, style=style)
+        bitmap_size = self._toolbar_bitmap_size()
+        toolbar.SetToolBitmapSize(bitmap_size)
+        self._main_toolbar = toolbar
+
+        def stock(art_id: str) -> wx.Bitmap:
+            return wx.ArtProvider.GetBitmap(art_id, wx.ART_TOOLBAR, bitmap_size)
+
+        def add_tool(
+            tool_id: int,
+            key: str,
+            art_id: str,
+            kind: int = wx.ITEM_NORMAL,
+        ) -> None:
+            help_text = t(key)
+            toolbar.AddTool(
+                tool_id,
+                self._toolbar_tool_label(key),
+                stock(art_id),
+                help_text,
+                kind,
+            )
+
+        add_tool(self.ID_OPEN_DIRECTORY, "toolbar.location", wx.ART_FOLDER_OPEN)
+        add_tool(self.ID_OPEN_SESSION, "toolbar.open_session", wx.ART_FILE_OPEN)
+        toolbar.AddSeparator()
+        add_tool(self.ID_IMPORT_PHONE, "toolbar.import_phone", wx.ART_GO_DOWN)
+        toolbar.AddSeparator()
+        add_tool(
+            self.ID_SHOW_DIRECTORY,
+            "toolbar.toggle_tree",
+            wx.ART_LIST_VIEW,
+            wx.ITEM_CHECK,
+        )
+        add_tool(
+            self.ID_SHOW_LOG,
+            "toolbar.toggle_log",
+            wx.ART_INFORMATION,
+            wx.ITEM_CHECK,
+        )
+        toolbar.AddSeparator()
+        add_tool(self.ID_CONVERT, "toolbar.convert", wx.ART_EXECUTABLE_FILE)
+        toolbar.Realize()
+        self._sync_toolbar_toggles()
+        return toolbar
+
+    def _refresh_main_toolbar(self) -> None:
+        if not hasattr(self, "_breadcrumb_bar") or not hasattr(self, "_main_toolbar"):
+            return
+        sizer = self._breadcrumb_bar.GetSizer()
+        if sizer is None:
+            return
+        old = self._main_toolbar
+        convert_enabled = old.GetToolEnabled(self.ID_CONVERT)
+        replace_index: int | None = None
+        for index in range(sizer.GetItemCount()):
+            if sizer.GetItem(index).GetWindow() == old:
+                replace_index = index
+                break
+        if replace_index is None:
+            return
+        item = sizer.GetItem(replace_index)
+        sizer.Detach(replace_index)
+        old.Destroy()
+        toolbar = self._build_main_toolbar(self._breadcrumb_bar)
+        sizer.Insert(
+            replace_index,
+            toolbar,
+            item.GetProportion(),
+            item.GetFlag(),
+            item.GetBorder(),
+        )
+        toolbar.EnableTool(self.ID_CONVERT, convert_enabled)
+        self._sync_toolbar_toggles()
+        self._apply_toolbar_visibility(self._toolbar_visible)
+        self._breadcrumb_bar.Layout()
+        self.Layout()
+
+    def _apply_toolbar_visibility(self, visible: bool) -> None:
+        if visible == self._toolbar_visible and hasattr(self, "_main_toolbar"):
+            if self._main_toolbar.IsShown() == visible:
+                self._view_menu.Check(self.ID_SHOW_TOOLBAR, visible)
+                return
+        self._toolbar_visible = visible
+        self._view_menu.Check(self.ID_SHOW_TOOLBAR, visible)
+        if hasattr(self, "_main_toolbar"):
+            self._main_toolbar.Show(visible)
+            toolbar_sizer = self._main_toolbar.GetContainingSizer()
+            if toolbar_sizer is not None:
+                item = toolbar_sizer.GetItem(self._main_toolbar)
+                if item is not None:
+                    item.Show(visible)
+        self._breadcrumb_bar.Layout()
+        self._refresh_workspace_layout()
+
+    def _on_show_toolbar_menu(self, event: wx.CommandEvent) -> None:
+        self._apply_toolbar_visibility(event.IsChecked())
+
+    def _update_toolbar_labels(self) -> None:
+        self._refresh_main_toolbar()
+
+    def _on_show_tool_labels_menu(self, event: wx.CommandEvent) -> None:
+        show = event.IsChecked()
+        if show == self.app_settings.show_tool_labels:
+            self._view_menu.Check(self.ID_SHOW_TOOL_LABELS, show)
+            return
+        self.app_settings.show_tool_labels = show
+        self._view_menu.Check(self.ID_SHOW_TOOL_LABELS, show)
+        save_app_settings(self.app_settings)
+        self._update_toolbar_labels()
+
+    def _sync_toolbar_toggles(self) -> None:
+        if not hasattr(self, "_main_toolbar"):
+            return
+        self._main_toolbar.ToggleTool(self.ID_SHOW_DIRECTORY, self._directory_tree_visible)
+        self._main_toolbar.ToggleTool(self.ID_SHOW_LOG, self._log_panel_visible)
+
+    def _on_toolbar_home(self, _event: wx.CommandEvent | None = None) -> None:
+        target = self.app_settings.recordings_location.expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        self._select_tree_directory(target)
+        self._load_directory_files(target)
+
+    def _on_large_tools_menu(self, event: wx.CommandEvent) -> None:
+        large = event.IsChecked()
+        if large == self.app_settings.large_tools:
+            self._view_menu.Check(self.ID_LARGE_TOOLS, large)
+            return
+        self.app_settings.large_tools = large
+        self._view_menu.Check(self.ID_LARGE_TOOLS, large)
+        self._apply_toolbar_size()
+
+    def _restore_layout(self) -> None:
+        if self.app_settings.window_x is not None and self.app_settings.window_y is not None:
+            self.SetPosition(wx.Point(self.app_settings.window_x, self.app_settings.window_y))
+        elif not self.app_settings.window_maximized:
+            self.Centre()
+
+        if self.app_settings.splitter_main_pos:
+            self._splitter_main.SetSashPosition(
+                self._clamp_file_splitter_sash(self.app_settings.splitter_main_pos)
+            )
+        self._apply_directory_tree_visibility(
+            self.app_settings.directory_tree_visible,
+            from_toggle=False,
+        )
+        if self._directory_tree_visible and self.app_settings.splitter_browser_pos:
+            self._splitter_browser_pos = self.app_settings.splitter_browser_pos
+            self._sync_tree_column_width()
+        self._apply_log_panel_visibility(self.app_settings.log_panel_visible)
+        self._apply_toolbar_visibility(self.app_settings.toolbar_visible)
+        self._file_menu.Check(self.ID_REFRESH_MODELS, self.settings.refresh_models)
+        self._view_menu.Check(self.ID_LARGE_TOOLS, self.app_settings.large_tools)
+        self._view_menu.Check(self.ID_SHOW_TOOL_LABELS, self.app_settings.show_tool_labels)
+
+        if self.app_settings.window_maximized:
+            self.Maximize(True)
+
+        if not self._log_panel_visible:
+            wx.CallAfter(self._expand_content_to_main_splitter)
+        else:
+            self._refresh_workspace_layout()
+
+    def _clamped_log_height(self, total_height: int) -> int:
+        if total_height <= 0:
+            return self._log_sash_height
+        max_log = max(LOG_PANEL_MIN_HEIGHT, total_height - MIN_CONTENT_HEIGHT)
+        return max(LOG_PANEL_MIN_HEIGHT, min(self._log_sash_height, max_log))
+
+    def _top_pane_height(self, total_height: int) -> int:
+        if total_height <= 0:
+            return MIN_CONTENT_HEIGHT
+        log_height = self._clamped_log_height(total_height)
+        top = total_height - log_height
+        top = min(top, total_height - LOG_PANEL_MIN_HEIGHT)
+        return max(1, top)
+
+    def _content_sash_position(self, total_height: int) -> int:
+        log_height = self._clamped_log_height(total_height)
+        if total_height <= 0:
+            return -log_height
+        return self._top_pane_height(total_height)
+
+    def _save_layout_settings(self) -> None:
+        if self.IsMaximized():
+            self.app_settings.window_maximized = True
+        else:
+            self.app_settings.window_maximized = False
+            size = self.GetSize()
+            pos = self.GetPosition()
+            self.app_settings.window_width = size.width
+            self.app_settings.window_height = size.height
+            self.app_settings.window_x = pos.x
+            self.app_settings.window_y = pos.y
+        if self._splitter_main.IsSplit():
+            sash = self._splitter_main.GetSashPosition()
+            if sash > 0:
+                self.app_settings.splitter_main_pos = sash
+        self.app_settings.splitter_browser_pos = self._splitter_browser_pos
+        self.app_settings.log_sash_height = self._log_sash_height
+        self.app_settings.directory_tree_visible = self._directory_tree_visible
+        self.app_settings.log_panel_visible = self._log_panel_visible
+        self.app_settings.toolbar_visible = self._toolbar_visible
+        self.app_settings.refresh_models = self.settings.refresh_models
+        save_app_settings(self.app_settings)
+
+    def _sync_tree_column_width(self) -> None:
+        if self._directory_tree_visible:
+            width = max(MIN_TREE_PANEL_WIDTH, self._splitter_browser_pos)
+            self._tree_panel.Show()
+            self._tree_panel.SetMinSize((width, -1))
+            self._tree_panel.SetMaxSize((width, -1))
+        else:
+            self._tree_panel.Hide()
+            self._tree_panel.SetMinSize((0, 0))
+            self._tree_panel.SetMaxSize((0, 0))
+        if hasattr(self, "_workspace_sizer"):
+            self._workspace_sizer.Layout()
+
+    def _apply_directory_tree_visibility(
+        self,
+        visible: bool,
+        *,
+        from_toggle: bool = True,
+    ) -> None:
+        del from_toggle
+        if visible == self._directory_tree_visible:
+            self._view_menu.Check(self.ID_SHOW_DIRECTORY, visible)
+            self._sync_toolbar_toggles()
+            return
+        self._directory_tree_visible = visible
+        self._view_menu.Check(self.ID_SHOW_DIRECTORY, visible)
+        self._sync_tree_column_width()
+        self._sync_toolbar_toggles()
+        self._refresh_workspace_layout()
+
+    def _refresh_workspace_layout(self) -> None:
+        self._main_splitter.Layout()
+        self._content_wrap.Layout()
+        self._workspace_sizer.Layout()
+        self._work_panel.Layout()
+        self._splitter_main.Layout()
+        parent = self._main_splitter.GetParent()
+        if parent is not None:
+            parent.Layout()
+        self.Layout()
+
+    def _expand_content_to_main_splitter(self) -> None:
+        client = self._main_splitter.GetClientSize()
+        if client.width > 0 and client.height > 0:
+            self._content_wrap.SetSize(client)
+        self._refresh_workspace_layout()
+
+    def _on_directory_tree_menu(self, event: wx.CommandEvent) -> None:
+        self._apply_directory_tree_visibility(event.IsChecked())
+
+    def _on_show_log_menu(self, event: wx.CommandEvent) -> None:
+        self._apply_log_panel_visibility(event.IsChecked())
+
+    def _on_refresh_models_menu(self, event: wx.CommandEvent) -> None:
+        refresh = event.IsChecked()
+        if refresh == self.settings.refresh_models:
+            return
+        self.settings.refresh_models = refresh
+        if self._backend is not None:
+            self._backend.unload()
+            self._backend = None
+
+    def _clamp_file_splitter_sash(self, sash: int) -> int:
+        client = self._splitter_main.GetClientSize()
+        if client.width <= 0:
+            return max(MIN_FILE_PANEL_WIDTH, sash)
+        sash_width = self._splitter_main.GetSashSize()
+        max_file = client.width - MIN_CHAT_PANEL_WIDTH - sash_width
+        if max_file < MIN_FILE_PANEL_WIDTH:
+            return MIN_FILE_PANEL_WIDTH
+        return max(MIN_FILE_PANEL_WIDTH, min(sash, max_file))
+
+    def _on_splitter_main_changing(self, event: wx.SplitterEvent) -> None:
+        sash = self._clamp_file_splitter_sash(event.GetSashPosition())
+        if sash != event.GetSashPosition():
+            event.SetSashPosition(sash)
+        event.Skip()
+
+    def _on_splitter_main_changed(self, event: wx.SplitterEvent) -> None:
+        if self._splitter_main.IsSplit():
+            sash = self._splitter_main.GetSashPosition()
+            if sash > 0:
+                self._splitter_file_pos = sash
+        event.Skip()
+
+    def _load_directory_files(self, directory: Path) -> None:
+        if self._converting_active or self._import_active:
+            return
+        try:
+            directory = directory.expanduser().resolve()
+        except OSError:
+            return
+        if not directory.is_dir():
+            return
+
+        self._current_directory = directory
+        self._set_breadcrumbs(directory)
+        self._persist_browser_directory(directory)
+        self._search_box.SetValue("")
+        self._search_keywords = []
+        self._selection_explicit_empty = True
+        self.entries.clear()
+
+        for path in _list_directory_paths(directory):
+            self._append_entry(path)
+
+        self.focus_index = None
+        self._sync_file_list()
+        self._deselect_all_file_rows()
+        self._clear_session_view()
+
+    def refresh_browser(self) -> None:
+        if self._converting_active or self._import_active:
+            return
+        directory = self._current_directory
+        if directory is None:
+            raw = self.app_settings.last_browser_directory
+            directory = raw if raw is not None else Path.home()
+        try:
+            directory = directory.expanduser().resolve()
+        except OSError:
+            return
+        if not directory.is_dir():
+            return
+        self._init_directory_tree()
+        self._select_tree_directory(directory)
+        self._load_directory_files(directory)
+
+    def _select_tree_directory(self, directory: Path) -> None:
+        try:
+            directory = directory.expanduser().resolve()
+        except OSError:
+            return
+        if not directory.is_dir():
+            directory = directory.parent
+        item = self._ensure_tree_item(directory)
+        if item is None or not item.IsOk():
+            return
+        self._tree_selecting = True
+        try:
+            self._dir_tree.SelectItem(item)
+            self._dir_tree.EnsureVisible(item)
+        finally:
+            wx.CallAfter(self._release_tree_selecting)
+
+    def _release_tree_selecting(self) -> None:
+        self._tree_selecting = False
+
+    def _ensure_tree_item(self, directory: Path) -> wx.TreeItemId | None:
+        try:
+            directory = directory.resolve()
+        except OSError:
+            return None
+        if self._tree_root_item is None or not self._tree_root_item.IsOk():
+            self._init_directory_tree()
+        item = self._dir_tree.GetRootItem()
+        if not item.IsOk():
+            return None
+        root_data = self._dir_tree.GetItemData(item)
+        if isinstance(root_data, Path):
+            current = root_data
+        else:
+            current = Path("/")
+
+        try:
+            rel_parts = directory.relative_to(current).parts
+        except ValueError:
+            current = Path(directory.anchor)
+            item = self._dir_tree.GetRootItem()
+            try:
+                rel_parts = directory.relative_to(current).parts
+            except ValueError:
+                return item if item.IsOk() else None
+
+        for part in rel_parts:
+            current = current / part
+            child = self._tree_find_child(item, current)
+            if child is None:
+                parent_data = self._dir_tree.GetItemData(item)
+                if isinstance(parent_data, Path):
+                    self._tree_populate_children(item, parent_data)
+                child = self._tree_find_child(item, current)
+                if child is None:
+                    child = self._tree_append_dir_node(item, current)
+            item = child
+            self._dir_tree.Expand(item)
+        return item
+
     def _bind_events(self) -> None:
-        self.Bind(wx.EVT_MENU, lambda _e: self.open_waveform(), id=self.ID_OPEN_WAVEFORM)
+        self.Bind(wx.EVT_MENU, lambda _e: self.open_directory(), id=self.ID_OPEN_DIRECTORY)
         self.Bind(wx.EVT_MENU, lambda _e: self.open_chat_session(), id=self.ID_OPEN_SESSION)
+        self.Bind(wx.EVT_MENU, lambda _e: self.import_from_phone(), id=self.ID_IMPORT_PHONE)
+        self.Bind(wx.EVT_MENU, self._on_refresh_models_menu, id=self.ID_REFRESH_MODELS)
+        self.Bind(wx.EVT_MENU, lambda _e: self.refresh_browser(), id=self.ID_REFRESH_BROWSER)
+        self.Bind(wx.EVT_MENU, lambda _e: self.open_settings(), id=self.ID_SETTINGS)
+        self.Bind(wx.EVT_MENU, self._on_directory_tree_menu, id=self.ID_SHOW_DIRECTORY)
+        self.Bind(wx.EVT_MENU, self._on_show_log_menu, id=self.ID_SHOW_LOG)
+        self.Bind(wx.EVT_MENU, self._on_show_toolbar_menu, id=self.ID_SHOW_TOOLBAR)
+        self.Bind(wx.EVT_MENU, self._on_large_tools_menu, id=self.ID_LARGE_TOOLS)
+        self.Bind(wx.EVT_MENU, self._on_show_tool_labels_menu, id=self.ID_SHOW_TOOL_LABELS)
         self.Bind(wx.EVT_MENU, lambda _e: self.Close(), id=self.ID_EXIT)
+        self.Bind(wx.EVT_TOOL, lambda _e: self.open_directory(), id=self.ID_OPEN_DIRECTORY)
+        self.Bind(wx.EVT_TOOL, lambda _e: self.open_chat_session(), id=self.ID_OPEN_SESSION)
+        self.Bind(wx.EVT_TOOL, lambda _e: self.import_from_phone(), id=self.ID_IMPORT_PHONE)
+        self.Bind(wx.EVT_TOOL, self._on_directory_tree_menu, id=self.ID_SHOW_DIRECTORY)
+        self.Bind(wx.EVT_TOOL, self._on_show_log_menu, id=self.ID_SHOW_LOG)
+        self.Bind(wx.EVT_TOOL, lambda _e: self.convert_pending(), id=self.ID_CONVERT)
         for code, item_id in self._lang_menu_ids.items():
             self.Bind(
                 wx.EVT_MENU,
@@ -683,13 +1713,18 @@ class Wav2ChatFrame(wx.Frame):
                 id=item_id,
             )
 
-        self._btn_select.Bind(wx.EVT_BUTTON, lambda _e: self.open_waveform())
-        self._btn_convert.Bind(wx.EVT_BUTTON, lambda _e: self.convert_pending())
-        self._chk_show_log.Bind(wx.EVT_CHECKBOX, self._on_show_log_toggled)
+        self._dir_tree.Bind(wx.EVT_TREE_SEL_CHANGED, self._on_dir_tree_sel_changed)
+        self._dir_tree.Bind(wx.EVT_TREE_ITEM_EXPANDING, self._on_dir_tree_expanding)
+        self._spin_min_speakers.BindValueChanged(self._on_min_speakers_changed)
+        self._spin_max_speakers.BindValueChanged(self._on_max_speakers_changed)
         self._main_splitter.Bind(wx.EVT_SPLITTER_SASH_POS_CHANGED, self._on_log_splitter_changed)
+        self._splitter_main.Bind(wx.EVT_SPLITTER_SASH_POS_CHANGING, self._on_splitter_main_changing)
+        self._splitter_main.Bind(wx.EVT_SPLITTER_SASH_POS_CHANGED, self._on_splitter_main_changed)
         self._file_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_file_selected)
         self._file_list.Bind(wx.EVT_LIST_ITEM_DESELECTED, self._on_file_deselected)
         self._file_list.Bind(wx.EVT_LEFT_DOWN, self._on_file_list_left_down)
+        self._file_list.Bind(wx.EVT_MOTION, self._on_file_list_motion)
+        self._file_list.Bind(wx.EVT_LEAVE_WINDOW, self._on_file_list_leave)
         self._file_list.Bind(wx.EVT_KEY_DOWN, self._on_file_list_key_down)
         self._file_list.Bind(wx.EVT_SIZE, self._on_file_list_size)
         self._search_box.Bind(wx.EVT_TEXT, self._on_search_changed)
@@ -702,14 +1737,45 @@ class Wav2ChatFrame(wx.Frame):
         self._bubble_panel.Bind(wx.EVT_SIZE, self._on_bubble_panel_size)
 
         self.Bind(wx.EVT_CLOSE, self._on_close)
+        self.Bind(wx.EVT_SIZE, self._on_frame_size)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_char_hook)
 
         self._accel_table = wx.AcceleratorTable(
             [
-                (wx.ACCEL_CTRL, ord("O"), self.ID_OPEN_WAVEFORM),
+                (wx.ACCEL_CTRL, ord("L"), self.ID_OPEN_DIRECTORY),
+                (wx.ACCEL_CTRL, ord("O"), self.ID_OPEN_SESSION),
+                (wx.ACCEL_CTRL, ord("I"), self.ID_IMPORT_PHONE),
+                (wx.ACCEL_CTRL, ord("R"), self.ID_REFRESH_BROWSER),
                 (wx.ACCEL_CTRL, ord("Q"), self.ID_EXIT),
             ]
         )
         self.SetAcceleratorTable(self._accel_table)
+
+    def _on_char_hook(self, event: wx.KeyEvent) -> None:
+        if event.HasAnyModifiers():
+            event.Skip()
+            return
+        key = event.GetKeyCode()
+        if key == wx.WXK_F2:
+            self._apply_directory_tree_visibility(not self._directory_tree_visible)
+            return
+        if key == wx.WXK_F4:
+            self._apply_log_panel_visibility(not self._log_panel_visible)
+            return
+        if key == wx.WXK_F6:
+            self._apply_toolbar_visibility(not self._toolbar_visible)
+            return
+        event.Skip()
+
+    def _on_frame_size(self, event: wx.SizeEvent) -> None:
+        if not self._log_panel_visible:
+            self._expand_content_to_main_splitter()
+        if self._splitter_main.IsSplit():
+            sash = self._splitter_main.GetSashPosition()
+            clamped = self._clamp_file_splitter_sash(sash)
+            if clamped != sash:
+                self._splitter_main.SetSashPosition(clamped)
+        event.Skip()
 
     def _set_status(self, key: str, **kwargs: object) -> None:
         self._status_key = key
@@ -747,10 +1813,19 @@ class Wav2ChatFrame(wx.Frame):
         else:
             self._set_status("status.progress", **kwargs)
             log_key = "status.progress"
-        self._append_log(logging.INFO, t(log_key, **kwargs))
 
-    def _on_show_log_toggled(self, event: wx.CommandEvent) -> None:
-        self._apply_log_panel_visibility(event.IsChecked())
+        should_log = (
+            phase != self._last_progress_log_phase
+            or file_percent is None
+            or self._last_progress_log_percent is None
+            or file_percent - self._last_progress_log_percent >= 5
+            or file_percent >= 95
+        )
+        if should_log:
+            self._append_log(logging.INFO, t(log_key, **kwargs))
+            self._last_progress_log_phase = phase
+            if file_percent is not None:
+                self._last_progress_log_percent = file_percent
 
     def _on_log_splitter_changed(self, event: wx.SplitterEvent) -> None:
         if self._log_panel_visible and self._main_splitter.IsSplit():
@@ -761,30 +1836,44 @@ class Wav2ChatFrame(wx.Frame):
 
     def _apply_log_panel_visibility(self, visible: bool) -> None:
         if visible == self._log_panel_visible:
+            self._view_menu.Check(self.ID_SHOW_LOG, visible)
+            self._sync_toolbar_toggles()
             return
         self._log_panel_visible = visible
+        self._view_menu.Check(self.ID_SHOW_LOG, visible)
+
+        total_height = self._main_splitter.GetClientSize().height
+        if total_height <= 0:
+            total_height = max(1, self.GetClientSize().height - 40)
+
         if visible:
             self._log_wrap.Show()
+            self._main_splitter.SetMinimumPaneSize(LOG_PANEL_MIN_HEIGHT)
+            log_height = self._clamped_log_height(total_height)
             if not self._main_splitter.IsSplit():
                 self._main_splitter.SplitHorizontally(
                     self._content_wrap,
                     self._log_wrap,
-                    -self._log_sash_height,
+                    -log_height,
                 )
-            else:
-                height = self._main_splitter.GetClientSize().height
-                self._main_splitter.SetSashPosition(
-                    max(LOG_PANEL_MIN_HEIGHT, height - self._log_sash_height)
-                )
+            elif total_height > log_height + LOG_PANEL_MIN_HEIGHT:
+                self._main_splitter.SetSashPosition(self._top_pane_height(total_height))
         else:
             if self._main_splitter.IsSplit():
-                sash = self._main_splitter.GetSashPosition()
                 height = self._main_splitter.GetClientSize().height
-                self._log_sash_height = max(LOG_PANEL_MIN_HEIGHT, height - sash)
+                if height > 0:
+                    sash = self._main_splitter.GetSashPosition()
+                    self._log_sash_height = max(LOG_PANEL_MIN_HEIGHT, height - sash)
                 self._main_splitter.Unsplit(self._content_wrap)
             self._log_wrap.Hide()
-        self._main_splitter.Layout()
-        self.Layout()
+            self._main_splitter.SetMinimumPaneSize(0)
+
+        self._content_wrap.Show()
+        self._sync_toolbar_toggles()
+        if visible:
+            self._refresh_workspace_layout()
+        else:
+            wx.CallAfter(self._expand_content_to_main_splitter)
 
     def _make_conversion_progress(
         self,
@@ -818,33 +1907,49 @@ class Wav2ChatFrame(wx.Frame):
         menubar = self.GetMenuBar()
         if menubar:
             menubar.SetMenuLabel(0, t("menu.file"))
-            menubar.SetMenuLabel(1, t("menu.language"))
+            menubar.SetMenuLabel(1, t("menu.edit"))
+            menubar.SetMenuLabel(2, t("menu.view"))
+            menubar.SetMenuLabel(3, t("menu.language"))
 
-        self._file_menu.SetLabel(self.ID_OPEN_WAVEFORM, t("menu.open_waveform"))
+        self._file_menu.SetLabel(self.ID_OPEN_DIRECTORY, t("menu.open_directory"))
         self._file_menu.SetLabel(self.ID_OPEN_SESSION, t("menu.open_chat_session"))
+        self._file_menu.SetLabel(self.ID_IMPORT_PHONE, t("menu.import_from_phone"))
+        self._file_menu.SetLabel(self.ID_REFRESH_MODELS, t("menu.refresh_models"))
         self._file_menu.SetLabel(self.ID_EXIT, t("menu.exit") + "\tCtrl+Q")
+        self._edit_menu.SetLabel(self.ID_SETTINGS, t("menu.settings"))
+        self._view_menu.SetLabel(self.ID_REFRESH_BROWSER, t("menu.refresh_browser"))
+        self._view_menu.SetLabel(self.ID_SHOW_DIRECTORY, t("menu.show_directory"))
+        self._view_menu.SetLabel(self.ID_SHOW_LOG, t("menu.show_loggings"))
+        self._view_menu.SetLabel(self.ID_SHOW_TOOLBAR, t("menu.show_toolbar"))
+        self._view_menu.SetLabel(self.ID_LARGE_TOOLS, t("menu.large_tools"))
+        self._view_menu.SetLabel(self.ID_SHOW_TOOL_LABELS, t("menu.show_tool_labels"))
         for code, item_id in self._lang_menu_ids.items():
             self._lang_menu.SetLabel(item_id, t(f"lang.{code}"))
 
-        self._label_audio_file.SetLabel(t("label.audio_file"))
         self._label_files.SetLabel(t("label.files"))
         try:
             if not self._search_box.HasFocus():
                 self._search_box.SetHint(t("hint.search"))
         except AttributeError:
             pass
-        self._btn_select.SetLabel(t("button.select"))
-        self._btn_convert.SetLabel(t("button.convert"))
+        self._label_speaker_count.SetLabel(t("label.speaker_count"))
+        self._label_speaker_to.SetLabel(t("label.speaker_count_to"))
+        self._label_speaker_unit.SetLabel(t("label.speaker_count_unit"))
+        self._update_toolbar_labels()
+        self._update_home_nav_button()
+        if self._current_directory is not None:
+            self._set_breadcrumbs(self._current_directory)
         self._chk_auto_convert.SetLabel(t("button.auto_convert"))
-        self._chk_show_log.SetLabel(t("button.show_log"))
         self._label_view.SetLabel(t("label.view"))
         self._rb_list.SetLabel(t("view.list"))
         self._rb_bubbles.SetLabel(t("view.bubbles"))
-        self._label_log.SetLabel(t("label.log"))
         col = self._file_list.GetColumn(NAME_COL)
         col.SetText(t("label.file_column"))
         self._file_list.SetColumn(NAME_COL, col)
         self._set_status(self._status_key, **self._status_kwargs)
+
+        if self._phone_import_dialog is not None:
+            self._phone_import_dialog.apply_locale()
 
         if self.focus_index is not None:
             entry = self._entry_at(self.focus_index)
@@ -1015,7 +2120,13 @@ class Wav2ChatFrame(wx.Frame):
             return
 
         self.focus_index = None
-        self._audio_path.SetValue("")
+        self._title_label.SetLabel(t("status.no_session"))
+        self._title_label.SetFont(self._ui_font_bold)
+        self._meta_label.SetLabel(t("status.select_or_convert"))
+        self._clear_chat_view()
+
+    def _clear_session_view(self) -> None:
+        self.focus_index = None
         self._title_label.SetLabel(t("status.no_session"))
         self._title_label.SetFont(self._ui_font_bold)
         self._meta_label.SetLabel(t("status.select_or_convert"))
@@ -1270,7 +2381,7 @@ class Wav2ChatFrame(wx.Frame):
     def _save_entry_transcript(self, entry: FileEntry) -> None:
         if entry.transcript is None:
             return
-        json_path = default_json_path(entry.path)
+        json_path = _entry_json_path(entry)
         write_transcript_outputs(entry.transcript, json_path=json_path, quiet=True)
 
     def _list_message_width(self) -> int:
@@ -1393,14 +2504,23 @@ class Wav2ChatFrame(wx.Frame):
         name = display_name(entry.transcript, segment) if entry.transcript else f"spk{segment.speaker}"
         return f"[{start} - {end}] {name}: {segment.text}"
 
-    def _bind_segment_play(self, window: wx.Window, segment_index: int) -> None:
+    def _bind_segment_play(
+        self,
+        window: wx.Window,
+        segment_index: int,
+        *,
+        playable: bool,
+    ) -> None:
+        if not playable:
+            return
+
         def on_click(event: wx.MouseEvent) -> None:
             self._on_segment_clicked(segment_index)
 
         window.Bind(wx.EVT_LEFT_DOWN, on_click)
         window.SetCursor(wx.Cursor(wx.CURSOR_HAND))
         for child in window.GetChildren():
-            self._bind_segment_play(child, segment_index)
+            self._bind_segment_play(child, segment_index, playable=playable)
 
     def _register_segment_row(
         self,
@@ -1433,7 +2553,7 @@ class Wav2ChatFrame(wx.Frame):
 
     def _on_segment_clicked(self, segment_index: int) -> None:
         entry = self._entry_at(self.focus_index)
-        if entry is None or entry.transcript is None:
+        if entry is None or entry.transcript is None or not _entry_has_playable_audio(entry):
             return
         segments = entry.transcript.segments
         if segment_index < 0 or segment_index >= len(segments):
@@ -1469,6 +2589,7 @@ class Wav2ChatFrame(wx.Frame):
         self._render_chunk_timer.Stop()
         self._segment_player.stop()
         self._stop_speaker_animation()
+        self._save_layout_settings()
         event.Skip()
 
     def _entry_at(self, index: int | None) -> FileEntry | None:
@@ -1488,7 +2609,6 @@ class Wav2ChatFrame(wx.Frame):
         return indices
 
     def _show_entry(self, entry: FileEntry) -> None:
-        self._audio_path.SetValue(str(entry.path))
         if entry.transcript:
             self._render_transcript(entry)
         else:
@@ -1509,6 +2629,35 @@ class Wav2ChatFrame(wx.Frame):
                 wx.LIST_STATE_SELECTED,
             )
 
+    def _file_name_truncated(self, list_row: int) -> bool:
+        label = self._file_list.GetItemText(list_row, NAME_COL)
+        if not label:
+            return False
+        col_width = self._file_list.GetColumnWidth(NAME_COL)
+        if col_width <= 8:
+            return False
+        text_width, _ = self._file_list.GetTextExtent(label)
+        return text_width >= col_width - 8
+
+    def _set_file_list_name_tooltip(self, text: str) -> None:
+        if text:
+            self._file_list.SetToolTip(text)
+        else:
+            self._file_list.UnsetToolTip()
+
+    def _on_file_list_motion(self, event: wx.MouseEvent) -> None:
+        pos = event.GetPosition()
+        list_row, flags = self._file_list.HitTest(pos)
+        tooltip = ""
+        if list_row != wx.NOT_FOUND and (flags & wx.LIST_HITTEST_ONITEMLABEL):
+            if self._file_name_truncated(list_row):
+                tooltip = self._file_list.GetItemText(list_row, NAME_COL)
+        self._set_file_list_name_tooltip(tooltip)
+        event.Skip()
+
+    def _on_file_list_leave(self, _event: wx.MouseEvent) -> None:
+        self._set_file_list_name_tooltip("")
+
     def _on_file_list_left_down(self, event: wx.MouseEvent) -> None:
         list_row, _flags = self._file_list.HitTest(event.GetPosition())
         if list_row != wx.NOT_FOUND:
@@ -1524,7 +2673,54 @@ class Wav2ChatFrame(wx.Frame):
         if event.ControlDown() and event.GetKeyCode() in (ord("A"), ord("a")):
             self._select_all_visible_files()
             return
+        if event.GetKeyCode() in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE):
+            self._delete_selected_entries()
+            return
         event.Skip()
+
+    def _delete_selected_entries(self) -> None:
+        if self._converting_active or self._import_active:
+            return
+        if self._selection_explicit_empty:
+            return
+
+        selected = sorted(set(self._selected_entry_indices()))
+        if not selected:
+            return
+
+        self._segment_player.stop()
+        self._playing_segment_index = None
+        self._stop_speaker_animation()
+
+        old_focus = self.focus_index
+        remove_count = len(selected)
+        for index in reversed(selected):
+            if 0 <= index < len(self.entries):
+                del self.entries[index]
+
+        if not self.entries:
+            self.focus_index = None
+            self._selection_explicit_empty = True
+            self._clear_session_view()
+        else:
+            if old_focus is not None and old_focus in selected:
+                new_focus = min(min(selected), len(self.entries) - 1)
+            elif old_focus is not None:
+                removed_before = sum(1 for index in selected if index < old_focus)
+                new_focus = old_focus - removed_before
+                new_focus = max(0, min(new_focus, len(self.entries) - 1))
+            else:
+                new_focus = 0
+            self.focus_index = new_focus
+            self._selection_explicit_empty = False
+
+        restore = {self.focus_index} if self.focus_index is not None else set()
+        self._sync_file_list(restore_selection=restore)
+        if self.focus_index is not None:
+            self._show_entry(self.entries[self.focus_index])
+
+        self._append_log(logging.INFO, t("log.removed_files", count=remove_count))
+        self._set_status("status.removed_files", count=remove_count)
 
     def _on_file_selected(self, event: wx.ListEvent) -> None:
         if self._suppress_file_select:
@@ -1729,16 +2925,18 @@ class Wav2ChatFrame(wx.Frame):
             list_max_width,
             row_colour,
         )
-        speaker_icon = self._make_speaker_icon(row)
         row_sizer.Add(message_ctrl, 0, wx.ALL, 8)
-        speaker_icon.SetBackgroundColour(row_colour)
-        row_sizer.Add(speaker_icon, 0, wx.ALIGN_TOP | wx.RIGHT, 6)
+        playable = _entry_has_playable_audio(entry)
+        if playable:
+            speaker_icon = self._make_speaker_icon(row)
+            speaker_icon.SetBackgroundColour(row_colour)
+            row_sizer.Add(speaker_icon, 0, wx.ALIGN_TOP | wx.RIGHT, 6)
+            self._speaker_icons[segment_index] = speaker_icon
         row.SetSizer(row_sizer)
         self._list_sizer.Add(row, 0, wx.EXPAND | wx.BOTTOM, 2)
         self._register_segment_row(row, row_colour, segment_index)
         self._segment_scroll_targets[segment_index] = row
-        self._speaker_icons[segment_index] = speaker_icon
-        self._bind_segment_play(row, segment_index)
+        self._bind_segment_play(row, segment_index, playable=playable)
 
     def _append_bubble_segment_row(
         self,
@@ -1792,9 +2990,12 @@ class Wav2ChatFrame(wx.Frame):
         bubble_sizer.Add(message_ctrl, 0, wx.ALL, BUBBLE_INNER_PAD)
         bubble.SetSizer(bubble_sizer)
 
-        speaker_icon = self._make_speaker_icon(row_panel)
-        self._speaker_icons[segment_index] = speaker_icon
-        speaker_icon.SetBackgroundColour(chat_bg)
+        playable = _entry_has_playable_audio(entry)
+        speaker_icon: wx.StaticText | None = None
+        if playable:
+            speaker_icon = self._make_speaker_icon(row_panel)
+            self._speaker_icons[segment_index] = speaker_icon
+            speaker_icon.SetBackgroundColour(chat_bg)
 
         bubble_top_flag = wx.ALIGN_TOP | wx.TOP
         bubble_top_border = first_line_top_pad if show_avatar else 0
@@ -1803,7 +3004,8 @@ class Wav2ChatFrame(wx.Frame):
 
         if is_me:
             row_sizer.AddStretchSpacer(1)
-            row_sizer.Add(speaker_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
+            if speaker_icon is not None:
+                row_sizer.Add(speaker_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 2)
             row_sizer.Add(
                 bubble,
                 0,
@@ -1845,14 +3047,15 @@ class Wav2ChatFrame(wx.Frame):
                 bubble_top_flag,
                 bubble_top_border if show_avatar else row_gap,
             )
-            row_sizer.Add(speaker_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 2)
+            if speaker_icon is not None:
+                row_sizer.Add(speaker_icon, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 2)
             row_sizer.AddStretchSpacer(1)
 
         row_panel.SetSizer(row_sizer)
         self._bubble_sizer.Add(row_panel, 0, wx.EXPAND | wx.TOP, row_gap)
         self._register_segment_row(bubble, bubble_colour, segment_index)
         self._segment_scroll_targets[segment_index] = row_panel
-        self._bind_segment_play(row_panel, segment_index)
+        self._bind_segment_play(row_panel, segment_index, playable=playable)
 
     def _resize_file_list_columns(self) -> None:
         client_size = self._file_list.GetClientSize()
@@ -1930,39 +3133,110 @@ class Wav2ChatFrame(wx.Frame):
                 collected.append(path)
         return collected
 
-    def _try_load_json_for_entry(self, entry: FileEntry) -> bool:
-        if entry.status == "converted" and entry.transcript is not None:
+    def _refresh_entry_metadata(self, entry: FileEntry) -> bool:
+        changed = False
+        if entry.session_only:
+            transcript = _try_load_transcript_json(entry.path)
+            if transcript is None:
+                if not entry.json_invalid or entry.transcript is not None:
+                    entry.json_invalid = True
+                    entry.transcript = None
+                    entry.status = "error"
+                    changed = True
+            elif entry.transcript != transcript or entry.json_invalid:
+                entry.transcript = transcript
+                entry.status = "converted"
+                entry.json_invalid = False
+                entry.error = None
+                changed = True
+            return changed
+
+        if not entry.has_audio:
             return False
+
         json_path = default_json_path(entry.path)
-        if not json_path.is_file():
+        if json_path.is_file():
+            transcript = _try_load_transcript_json(json_path)
+            if transcript is not None:
+                if entry.transcript != transcript or entry.status != "converted" or entry.json_invalid:
+                    entry.transcript = transcript
+                    entry.status = "converted"
+                    entry.json_invalid = False
+                    entry.error = None
+                    changed = True
+            elif not entry.json_invalid or entry.transcript is not None:
+                entry.transcript = None
+                entry.status = "unconverted"
+                entry.json_invalid = True
+                changed = True
+        elif entry.json_invalid:
+            entry.json_invalid = False
+            changed = True
+        return changed
+
+    def _try_load_json_for_entry(self, entry: FileEntry) -> bool:
+        if entry.status == "converted" and entry.transcript is not None and not entry.json_invalid:
             return False
-        try:
-            entry.transcript = Transcript.load_json(json_path)
-            entry.status = "converted"
-            entry.error = None
-            return True
-        except (OSError, ValueError, KeyError, TypeError):
-            return False
+        return self._refresh_entry_metadata(entry)
+
+    def _append_audio_entry(self, path: Path) -> int:
+        entry = FileEntry(path=path, has_audio=True)
+        json_path = default_json_path(path)
+        if json_path.is_file():
+            transcript = _try_load_transcript_json(json_path)
+            if transcript is not None:
+                entry.transcript = transcript
+                entry.status = "converted"
+            else:
+                entry.json_invalid = True
+        self.entries.append(entry)
+        return len(self.entries) - 1
+
+    def _append_json_entry(self, path: Path) -> int:
+        transcript = _try_load_transcript_json(path)
+        if transcript is None:
+            self.entries.append(
+                FileEntry(
+                    path=path,
+                    has_audio=False,
+                    json_invalid=True,
+                    status="error",
+                )
+            )
+            return len(self.entries) - 1
+
+        audio = _find_audio_for_stem(path.with_suffix(""))
+        if audio is not None:
+            entry = FileEntry(
+                path=audio,
+                has_audio=True,
+                transcript=transcript,
+                status="converted",
+            )
+        else:
+            entry = FileEntry(
+                path=path,
+                has_audio=False,
+                session_only=True,
+                transcript=transcript,
+                status="converted",
+            )
+        self.entries.append(entry)
+        return len(self.entries) - 1
 
     def _append_entry(self, path: Path) -> int | None:
         """Add or refresh an entry. Returns its index, or None if unchanged."""
         for index, entry in enumerate(self.entries):
             if entry.path == path:
-                if self._try_load_json_for_entry(entry):
+                if self._refresh_entry_metadata(entry):
                     return index
                 return None
-        json_path = default_json_path(path)
-        if json_path.is_file():
-            try:
-                transcript = Transcript.load_json(json_path)
-                self.entries.append(
-                    FileEntry(path=path, status="converted", transcript=transcript)
-                )
-                return len(self.entries) - 1
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-        self.entries.append(FileEntry(path=path))
-        return len(self.entries) - 1
+
+        if path.suffix.lower() == ".json":
+            return self._append_json_entry(path)
+        if is_supported_audio(path):
+            return self._append_audio_entry(path)
+        return None
 
     def _after_paths_added(self, added_indices: list[int]) -> None:
         if not added_indices:
@@ -2096,20 +3370,73 @@ class Wav2ChatFrame(wx.Frame):
         if self._chk_auto_convert.GetValue():
             wx.CallAfter(self._convert_entry_indices, added_indices)
 
-    def open_waveform(self) -> None:
-        dialog = wx.FileDialog(
+    def open_directory(self) -> None:
+        default = str(self._current_directory or Path.home())
+        dialog = wx.DirDialog(
             self,
-            message=t("dialog.open_waveform"),
-            wildcard=f"{t('filetype.audio')}|{AUDIO_WILDCARD}|{t('filetype.all')}|*.*",
-            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
+            message=t("dialog.open_directory"),
+            defaultPath=default,
+            style=wx.DD_DEFAULT_STYLE,
         )
         if dialog.ShowModal() != wx.ID_OK:
             dialog.Destroy()
             return
-        paths = dialog.GetPaths()
+        selected = dialog.GetPath()
         dialog.Destroy()
-        if paths:
-            self._add_paths([Path(path) for path in paths])
+        path = Path(selected)
+        self._select_tree_directory(path)
+        self._load_directory_files(path)
+
+    def _persist_browser_directory(self, directory: Path) -> None:
+        self.app_settings.last_browser_directory = directory
+        save_app_settings(self.app_settings)
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self, self.app_settings)
+        if dialog.ShowModal() != wx.ID_OK:
+            dialog.Destroy()
+            return
+        self.app_settings = dialog.result
+        self.app_settings.recordings_location.mkdir(parents=True, exist_ok=True)
+        save_app_settings(self.app_settings)
+        dialog.Destroy()
+
+    def import_from_phone(self) -> None:
+        if self._import_active:
+            wx.MessageBox(
+                t("log.import_busy"),
+                t("dialog.import_from_phone"),
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+            return
+        if self._phone_import_dialog is not None:
+            self._phone_import_dialog.Raise()
+            return
+        dialog = PhoneImportDialog(
+            self,
+            self.app_settings,
+            on_complete=self._on_phone_import_complete,
+            on_closed=self._on_phone_import_dialog_closed,
+            on_status=self._set_status_text,
+        )
+        self._phone_import_dialog = dialog
+        dialog.Show()
+
+    def _on_phone_import_dialog_closed(self) -> None:
+        self._phone_import_dialog = None
+        self._set_status("status.ready")
+
+    def _on_phone_import_complete(self, result: PhoneImportResult) -> None:
+        save_app_settings(self.app_settings)
+        target = result.first_destination_dir or result.last_destination_dir
+        if target is None:
+            return
+        if self._converting_active:
+            self._pending_browser_directory = target
+            return
+        self._select_tree_directory(target)
+        self._load_directory_files(target)
 
     def open_chat_session(self) -> None:
         dialog = wx.FileDialog(
@@ -2135,14 +3462,22 @@ class Wav2ChatFrame(wx.Frame):
             )
             return
 
-        source_path = path.with_suffix("")
-        for ext in SUPPORTED_EXTENSIONS:
-            candidate = source_path.with_suffix(ext)
-            if candidate.is_file():
-                source_path = candidate
-                break
-
-        entry = FileEntry(path=source_path, status="converted", transcript=transcript)
+        audio = _find_audio_for_stem(path.with_suffix(""))
+        if audio is not None:
+            entry = FileEntry(
+                path=audio,
+                status="converted",
+                transcript=transcript,
+                has_audio=True,
+            )
+        else:
+            entry = FileEntry(
+                path=path,
+                status="converted",
+                transcript=transcript,
+                has_audio=False,
+                session_only=True,
+            )
         self.entries.insert(0, entry)
         self.focus_index = 0
         self._selection_explicit_empty = False
@@ -2155,12 +3490,63 @@ class Wav2ChatFrame(wx.Frame):
 
     def _get_backend(self) -> FunASRBackend:
         if self._backend is None:
+            if self.settings.refresh_models:
+                log_key = "log.refreshing_models"
+            else:
+                log_key = "log.loading_models_cache"
             self._ui_queue.put(("status_text", ("status.loading_models", {})))
-            self._backend = FunASRBackend(
+            self._ui_queue.put(
+                (
+                    "log",
+                    (logging.INFO, t(log_key)),
+                )
+            )
+            backend = FunASRBackend(
                 min_speakers=self.settings.min_speakers,
                 max_speakers=self.settings.max_speakers,
+                refresh_models=self.settings.refresh_models,
             )
+            backend.load()
+            self._backend = backend
+            if self.settings.refresh_models:
+                wx.CallAfter(self._file_menu.Check, self.ID_REFRESH_MODELS, False)
+                self.settings.refresh_models = False
         return self._backend
+
+    def _speaker_count_defaults(self) -> tuple[int, int]:
+        min_s = self.settings.min_speakers if self.settings.min_speakers is not None else 2
+        max_s = self.settings.max_speakers if self.settings.max_speakers is not None else 2
+        if max_s < min_s:
+            max_s = min_s
+        return min_s, max_s
+
+    def _apply_convert_settings_from_ui(self) -> None:
+        min_spk = self._spin_min_speakers.GetValue()
+        max_spk = self._spin_max_speakers.GetValue()
+        if max_spk < min_spk:
+            self._spin_max_speakers.SetValue(min_spk)
+            max_spk = min_spk
+        refresh = self._file_menu.IsChecked(self.ID_REFRESH_MODELS)
+        settings_changed = (
+            min_spk != self.settings.min_speakers
+            or max_spk != self.settings.max_speakers
+            or refresh != self.settings.refresh_models
+        )
+        self.settings.min_speakers = min_spk
+        self.settings.max_speakers = max_spk
+        self.settings.refresh_models = refresh
+        if settings_changed or refresh:
+            if self._backend is not None:
+                self._backend.unload()
+            self._backend = None
+
+    def _on_min_speakers_changed(self) -> None:
+        if self._spin_max_speakers.GetValue() < self._spin_min_speakers.GetValue():
+            self._spin_max_speakers.SetValue(self._spin_min_speakers.GetValue())
+
+    def _on_max_speakers_changed(self) -> None:
+        if self._spin_max_speakers.GetValue() < self._spin_min_speakers.GetValue():
+            self._spin_min_speakers.SetValue(self._spin_max_speakers.GetValue())
 
     def convert_pending(self) -> None:
         self._convert_entry_indices(self._convert_target_entry_indices())
@@ -2173,7 +3559,10 @@ class Wav2ChatFrame(wx.Frame):
             index
             for index in indices
             if 0 <= index < len(self.entries)
+            and self.entries[index].has_audio
+            and is_supported_audio(self.entries[index].path)
             and self.entries[index].status in {"unconverted", "error"}
+            and not self.entries[index].json_invalid
         ]
 
         if not pending:
@@ -2193,14 +3582,21 @@ class Wav2ChatFrame(wx.Frame):
                 self._set_status("status.nothing_to_convert")
             return
 
+        self._apply_convert_settings_from_ui()
+
         self._converting_active = True
+        self._last_progress_log_phase = None
+        self._last_progress_log_percent = None
         self._set_progress(0)
         self._append_log(
             logging.INFO,
             t("log.start_batch", count=len(pending)),
         )
 
-        self._btn_convert.Disable()
+        self._main_toolbar.EnableTool(self.ID_CONVERT, False)
+        self._spin_min_speakers.Disable()
+        self._spin_max_speakers.Disable()
+        self._file_menu.Enable(self.ID_REFRESH_MODELS, False)
         self._stop_convert.clear()
         self._convert_thread = threading.Thread(
             target=self._convert_worker,
@@ -2347,7 +3743,15 @@ class Wav2ChatFrame(wx.Frame):
         elif kind == "done":
             self._converting_active = False
             self._set_progress(None)
-            self._btn_convert.Enable()
+            self._main_toolbar.EnableTool(self.ID_CONVERT, True)
+            self._spin_min_speakers.Enable()
+            self._spin_max_speakers.Enable()
+            self._file_menu.Enable(self.ID_REFRESH_MODELS, True)
+            if self._pending_browser_directory is not None:
+                target = self._pending_browser_directory
+                self._pending_browser_directory = None
+                self._select_tree_directory(target)
+                self._load_directory_files(target)
         return False
 
 
@@ -2368,6 +3772,7 @@ def main(args: argparse.Namespace) -> int:
         keep_temp=args.keep_temp,
         verbose=args.verbose,
         quiet=args.quiet,
+        refresh_models=getattr(args, "refresh_models", False),
     )
 
     initial_paths: list[Path] = []
