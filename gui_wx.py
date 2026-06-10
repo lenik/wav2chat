@@ -20,7 +20,7 @@ from wav2chat.app_settings import (
     save_app_settings,
 )
 from wav2chat.audio_playback import SegmentPlayer, segment_play_range
-from wav2chat.dialog_utils import bind_dialog_escape_close
+from wav2chat.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
 from wav2chat.errors import FunASREmptyResultError, Wav2ChatError
 from wav2chat.fs_browser import (
     TREE_DUMMY_LABEL,
@@ -32,10 +32,13 @@ from wav2chat.funasr_backend import FunASRBackend
 from wav2chat.i18n import SUPPORTED_LOCALES, set_locale, t
 from wav2chat.models import Segment, Speaker, Transcript
 from wav2chat.pipeline import (
+    CHATLOG_EXTENSION,
     SUPPORTED_EXTENSIONS,
     convert_file,
     default_json_path,
+    find_transcript_path,
     is_supported_audio,
+    is_transcript_path,
     write_transcript_outputs,
 )
 from wav2chat.render import display_name, format_timestamp
@@ -45,7 +48,7 @@ from wav2chat.settings_dialog import SettingsDialog
 from wav2chat.speaker_ui import RoundedAvatarPanel, SpeakerProfileDialog
 
 AUDIO_WILDCARD = "*.wav;*.mp3;*.m4a;*.amr;*.aac;*.flac;*.ogg"
-JSON_WILDCARD = "*.json"
+CHATLOG_WILDCARD = "*.chatlog;*.json"
 
 IMG_UNCONVERTED = 0
 IMG_CONVERTED = 1
@@ -111,77 +114,35 @@ SPEAKER_AVATAR_RGBS = (
 def _rgb_colour(red: int, green: int, blue: int) -> wx.Colour:
     return wx.Colour(red, green, blue)
 
-# Fonts with broad Unicode / CJK coverage (first match on the system wins).
-_UNICODE_FONT_FACES = (
-    "Noto Sans CJK SC",
-    "Noto Sans CJK JP",
-    "Noto Sans CJK KR",
-    "Noto Sans CJK TC",
-    "Noto Sans CJK HK",
-    "Noto Sans",
-    "Source Han Sans SC",
-    "Source Han Sans CN",
-    "Source Han Sans",
-    "WenQuanYi Micro Hei",
-    "Droid Sans Fallback",
-    "Arial Unicode MS",
-    "PingFang SC",
-    "Hiragino Sans GB",
-    "Malgun Gothic",
-    "Segoe UI",
-    "Noto Color Emoji",
-    "Segoe UI Emoji",
-    "DejaVu Sans",
-)
-
-_installed_font_faces: set[str] | None = None
+from wav2chat.ui_fonts import apply_ui_font, pick_unicode_font
 
 
-def _collect_installed_font_faces() -> set[str]:
-    global _installed_font_faces
-    if _installed_font_faces is not None:
-        return _installed_font_faces
-
-    faces: set[str] = set()
-
-    def _remember(face: str, *_args: object) -> None:
-        faces.add(face)
-
-    try:
-        wx.FontEnumerator(_remember)
-    except Exception:
-        pass
-
-    _installed_font_faces = faces
-    return faces
+MENU_BITMAP_SIZE = 16
 
 
-def _pick_unicode_font(
-    point_size: int | None = None,
-    weight: int = wx.FONTWEIGHT_NORMAL,
-) -> wx.Font:
-    """Return a GUI font that covers Latin, CJK, and other UI locales."""
-    default = wx.SystemSettings.GetFont(wx.SYS_DEFAULT_GUI_FONT)
-    if point_size is None:
-        point_size = default.GetPointSize()
-
-    installed = _collect_installed_font_faces()
-    for face in _UNICODE_FONT_FACES:
-        if installed and face not in installed:
-            continue
-        font = wx.Font(wx.FontInfo(point_size).FaceName(face).Weight(weight))
-        if font.IsOk():
-            return font
-
-    fallback = wx.Font(default)
-    fallback.SetWeight(weight)
-    return fallback
+def _menu_stock_bitmap(art_id: str) -> wx.Bitmap:
+    return wx.ArtProvider.GetBitmap(
+        art_id,
+        wx.ART_MENU,
+        wx.Size(MENU_BITMAP_SIZE, MENU_BITMAP_SIZE),
+    )
 
 
-def _apply_ui_font(window: wx.Window, font: wx.Font) -> None:
-    window.SetFont(font)
-    for child in window.GetChildren():
-        _apply_ui_font(child, font)
+def _append_menu_item(
+    menu: wx.Menu,
+    item_id: int,
+    label: str,
+    *,
+    art_id: str | None = None,
+    kind: int = wx.ITEM_NORMAL,
+) -> wx.MenuItem:
+    item = wx.MenuItem(menu, item_id, label, kind=kind)
+    if art_id is not None and kind == wx.ITEM_NORMAL:
+        bitmap = _menu_stock_bitmap(art_id)
+        if bitmap.IsOk():
+            item.SetBitmap(bitmap)
+    menu.Append(item)
+    return item
 
 
 class _FlatLinkButton(wx.Panel):
@@ -262,21 +223,22 @@ class _FlatLinkButton(wx.Panel):
         self.Refresh()
 
     def _on_left_down(self, event: wx.MouseEvent) -> None:
-        if not self._enabled:
-            return
-        if not self.HasCapture():
-            self.CaptureMouse()
         event.Skip()
 
     def _on_left_up(self, event: wx.MouseEvent) -> None:
-        if self.HasCapture():
-            self.ReleaseMouse()
-        if not self._enabled:
+        handler = self._click_handler
+        if not self._enabled or handler is None:
+            event.Skip()
             return
-        rect = self.GetClientRect()
-        if self._hover and rect.Contains(event.GetPosition()) and self._click_handler is not None:
-            self._click_handler()
+        source = event.GetEventObject()
+        if not isinstance(source, wx.Window):
+            event.Skip()
+            return
+        pos = self.ScreenToClient(source.ClientToScreen(event.GetPosition()))
+        clicked = self.GetClientRect().Contains(pos)
         event.Skip()
+        if clicked:
+            wx.CallAfter(handler)
 
 
 class _IntSpinRow(wx.Panel):
@@ -467,14 +429,16 @@ def _list_directory_paths(directory: Path) -> list[Path]:
     except OSError:
         return []
     audio_paths = [path for path in items if is_supported_audio(path)]
-    json_paths = [
-        path for path in items if path.is_file() and path.suffix.lower() == ".json"
+    chatlog_paths = [
+        path
+        for path in items
+        if path.is_file() and path.suffix.lower() == CHATLOG_EXTENSION
     ]
     audio_stems = {path.stem for path in audio_paths}
     combined = list(audio_paths)
-    for json_path in json_paths:
-        if json_path.stem not in audio_stems:
-            combined.append(json_path)
+    for chatlog_path in chatlog_paths:
+        if chatlog_path.stem not in audio_stems:
+            combined.append(chatlog_path)
     return sorted(combined, key=lambda p: p.name.lower())
 
 
@@ -634,6 +598,7 @@ class _ImportDialog(wx.Dialog):
         sizer.Add(self._gauge, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 12)
         self.SetSizer(sizer)
         self.Fit()
+        setup_dialog_fonts(self)
         bind_dialog_escape_close(self)
         self.CentreOnParent()
 
@@ -680,9 +645,11 @@ class Wav2ChatFrame(wx.Frame):
         settings: GuiSettings,
         initial_paths: list[Path] | None = None,
     ) -> None:
-        set_locale(settings.ui_lang)
-
         app_settings = load_app_settings()
+        ui_lang = settings.ui_lang or app_settings.ui_lang
+        settings.ui_lang = ui_lang
+        set_locale(ui_lang)
+
         super().__init__(
             None,
             title=t("app.window_title"),
@@ -953,13 +920,13 @@ class Wav2ChatFrame(wx.Frame):
         self._sync_tree_column_width()
 
     def _setup_ui_fonts(self) -> None:
-        self._ui_font = _pick_unicode_font()
-        self._ui_font_bold = _pick_unicode_font(weight=wx.FONTWEIGHT_BOLD)
+        self._ui_font = pick_unicode_font()
+        self._ui_font_bold = pick_unicode_font(weight=wx.FONTWEIGHT_BOLD)
         self._caption_font = wx.Font(self._ui_font)
         self._caption_font.SetPointSize(max(8, self._ui_font.GetPointSize() - 2))
         self._emoji_font = wx.Font(self._ui_font)
         self._emoji_font.SetPointSize(self._ui_font.GetPointSize() + 2)
-        _apply_ui_font(self, self._ui_font)
+        apply_ui_font(self, self._ui_font)
         self._title_label.SetFont(self._ui_font_bold)
         self._log_panel.SetFont(self._ui_font)
         menubar = self.GetMenuBar()
@@ -1023,27 +990,87 @@ class Wav2ChatFrame(wx.Frame):
     def _build_menubar(self) -> None:
         menubar = wx.MenuBar()
         file_menu = wx.Menu()
-        file_menu.Append(self.ID_OPEN_DIRECTORY, t("menu.open_directory"))
-        file_menu.Append(self.ID_OPEN_SESSION, t("menu.open_chat_session"))
-        file_menu.Append(self.ID_IMPORT_PHONE, t("menu.import_from_phone"))
+        _append_menu_item(
+            file_menu,
+            self.ID_OPEN_DIRECTORY,
+            t("menu.open_directory"),
+            art_id=wx.ART_FOLDER_OPEN,
+        )
+        _append_menu_item(
+            file_menu,
+            self.ID_OPEN_SESSION,
+            t("menu.open_chat_session"),
+            art_id=wx.ART_FILE_OPEN,
+        )
+        _append_menu_item(
+            file_menu,
+            self.ID_IMPORT_PHONE,
+            t("menu.import_from_phone"),
+            art_id=wx.ART_GO_DOWN,
+        )
         file_menu.AppendSeparator()
-        file_menu.AppendCheckItem(self.ID_REFRESH_MODELS, t("menu.refresh_models"))
+        _append_menu_item(
+            file_menu,
+            self.ID_REFRESH_MODELS,
+            t("menu.refresh_models"),
+            kind=wx.ITEM_CHECK,
+        )
         file_menu.Check(self.ID_REFRESH_MODELS, self.settings.refresh_models)
         file_menu.AppendSeparator()
-        file_menu.Append(self.ID_EXIT, t("menu.exit") + "\tCtrl+Q")
+        _append_menu_item(
+            file_menu,
+            self.ID_EXIT,
+            t("menu.exit") + "\tCtrl+Q",
+            art_id=wx.ART_QUIT,
+        )
 
         edit_menu = wx.Menu()
-        edit_menu.Append(self.ID_SETTINGS, t("menu.settings"))
+        _append_menu_item(
+            edit_menu,
+            self.ID_SETTINGS,
+            t("menu.settings"),
+            art_id=wx.ART_HELP_SETTINGS,
+        )
 
         view_menu = wx.Menu()
-        view_menu.Append(self.ID_REFRESH_BROWSER, t("menu.refresh_browser"))
+        _append_menu_item(
+            view_menu,
+            self.ID_REFRESH_BROWSER,
+            t("menu.refresh_browser"),
+            art_id=wx.ART_REDO,
+        )
         view_menu.AppendSeparator()
-        view_menu.AppendCheckItem(self.ID_SHOW_DIRECTORY, t("menu.show_directory"))
-        view_menu.AppendCheckItem(self.ID_SHOW_LOG, t("menu.show_loggings"))
+        _append_menu_item(
+            view_menu,
+            self.ID_SHOW_DIRECTORY,
+            t("menu.show_directory"),
+            kind=wx.ITEM_CHECK,
+        )
+        _append_menu_item(
+            view_menu,
+            self.ID_SHOW_LOG,
+            t("menu.show_loggings"),
+            kind=wx.ITEM_CHECK,
+        )
         view_menu.AppendSeparator()
-        view_menu.AppendCheckItem(self.ID_SHOW_TOOLBAR, t("menu.show_toolbar"))
-        view_menu.AppendCheckItem(self.ID_LARGE_TOOLS, t("menu.large_tools"))
-        view_menu.AppendCheckItem(self.ID_SHOW_TOOL_LABELS, t("menu.show_tool_labels"))
+        _append_menu_item(
+            view_menu,
+            self.ID_SHOW_TOOLBAR,
+            t("menu.show_toolbar"),
+            kind=wx.ITEM_CHECK,
+        )
+        _append_menu_item(
+            view_menu,
+            self.ID_LARGE_TOOLS,
+            t("menu.large_tools"),
+            kind=wx.ITEM_CHECK,
+        )
+        _append_menu_item(
+            view_menu,
+            self.ID_SHOW_TOOL_LABELS,
+            t("menu.show_tool_labels"),
+            kind=wx.ITEM_CHECK,
+        )
         view_menu.Check(self.ID_SHOW_DIRECTORY, self._directory_tree_visible)
         view_menu.Check(self.ID_SHOW_LOG, self._log_panel_visible)
         view_menu.Check(self.ID_SHOW_TOOLBAR, self._toolbar_visible)
@@ -1138,16 +1165,21 @@ class Wav2ChatFrame(wx.Frame):
     def _set_breadcrumbs(self, directory: Path) -> None:
         self._breadcrumb_sizer.Clear(delete_windows=True)
         segments = path_breadcrumb_segments(directory)
-        nav_bg = self._breadcrumb_nav_background()
         for index, (label, segment_path) in enumerate(segments):
             if index > 0:
-                separator = wx.StaticText(self._breadcrumb_panel, label=" > ")
-                separator.SetBackgroundColour(nav_bg)
-                self._breadcrumb_sizer.Add(separator, 0, wx.ALIGN_CENTER_VERTICAL)
+                chevron = _FlatLinkButton(self._breadcrumb_panel, ">")
+                chevron.SetToolTip(t("tooltip.breadcrumb_siblings"))
+                chevron.BindClick(
+                    lambda path=segment_path, btn=chevron: self._on_breadcrumb_siblings(
+                        path,
+                        btn,
+                    ),
+                )
+                self._breadcrumb_sizer.Add(chevron, 0, wx.ALIGN_CENTER_VERTICAL)
             button = _FlatLinkButton(self._breadcrumb_panel, label)
             button.SetToolTip(str(segment_path))
             button.BindClick(
-                lambda path=segment_path, btn=button: self._on_breadcrumb_segment(path, btn),
+                lambda path=segment_path: self._navigate_from_breadcrumb(path),
             )
             self._breadcrumb_sizer.Add(button, 0, wx.ALIGN_CENTER_VERTICAL)
         self._apply_breadcrumb_nav_colours()
@@ -1172,18 +1204,14 @@ class Wav2ChatFrame(wx.Frame):
                 elif isinstance(window, wx.StaticText):
                     window.SetBackgroundColour(bg)
 
-    def _on_breadcrumb_segment(
+    def _on_breadcrumb_siblings(
         self,
         segment_path: Path,
-        button: _FlatLinkButton,
+        anchor: wx.Window,
     ) -> None:
-        if len(path_breadcrumb_segments(segment_path)) <= 1:
-            self._navigate_from_breadcrumb(segment_path)
-            return
         parent_dir = segment_path.parent
         siblings = list_subdirectories(parent_dir)
         if not siblings:
-            self._navigate_from_breadcrumb(segment_path)
             return
 
         menu = wx.Menu()
@@ -1199,8 +1227,8 @@ class Wav2ChatFrame(wx.Frame):
                 id=item_id,
             )
 
-        pos = button.GetScreenPosition()
-        size = button.GetSize()
+        pos = anchor.GetScreenPosition()
+        size = anchor.GetSize()
         self._breadcrumb_panel.PopupMenu(
             menu,
             self._breadcrumb_panel.ScreenToClient(wx.Point(pos.x, pos.y + size.height)),
@@ -1234,6 +1262,7 @@ class Wav2ChatFrame(wx.Frame):
             (self.ID_IMPORT_PHONE, wx.ART_GO_DOWN),
             (self.ID_SHOW_DIRECTORY, wx.ART_LIST_VIEW),
             (self.ID_SHOW_LOG, wx.ART_INFORMATION),
+            (self.ID_SETTINGS, wx.ART_HELP_SETTINGS),
             (self.ID_CONVERT, wx.ART_EXECUTABLE_FILE),
         )
 
@@ -1333,6 +1362,8 @@ class Wav2ChatFrame(wx.Frame):
             wx.ART_INFORMATION,
             wx.ITEM_CHECK,
         )
+        toolbar.AddSeparator()
+        add_tool(self.ID_SETTINGS, "toolbar.settings", wx.ART_HELP_SETTINGS)
         toolbar.AddSeparator()
         add_tool(self.ID_CONVERT, "toolbar.convert", wx.ART_EXECUTABLE_FILE)
         toolbar.Realize()
@@ -1496,6 +1527,7 @@ class Wav2ChatFrame(wx.Frame):
         self.app_settings.directory_tree_visible = self._directory_tree_visible
         self.app_settings.log_panel_visible = self._log_panel_visible
         self.app_settings.toolbar_visible = self._toolbar_visible
+        self.app_settings.ui_lang = self.settings.ui_lang
         self.app_settings.refresh_models = self.settings.refresh_models
         save_app_settings(self.app_settings)
 
@@ -1705,6 +1737,7 @@ class Wav2ChatFrame(wx.Frame):
         self.Bind(wx.EVT_TOOL, lambda _e: self.import_from_phone(), id=self.ID_IMPORT_PHONE)
         self.Bind(wx.EVT_TOOL, self._on_directory_tree_menu, id=self.ID_SHOW_DIRECTORY)
         self.Bind(wx.EVT_TOOL, self._on_show_log_menu, id=self.ID_SHOW_LOG)
+        self.Bind(wx.EVT_TOOL, lambda _e: self.open_settings(), id=self.ID_SETTINGS)
         self.Bind(wx.EVT_TOOL, lambda _e: self.convert_pending(), id=self.ID_CONVERT)
         for code, item_id in self._lang_menu_ids.items():
             self.Bind(
@@ -1746,6 +1779,7 @@ class Wav2ChatFrame(wx.Frame):
                 (wx.ACCEL_CTRL, ord("O"), self.ID_OPEN_SESSION),
                 (wx.ACCEL_CTRL, ord("I"), self.ID_IMPORT_PHONE),
                 (wx.ACCEL_CTRL, ord("R"), self.ID_REFRESH_BROWSER),
+                (wx.ACCEL_NORMAL, wx.WXK_F7, self.ID_SETTINGS),
                 (wx.ACCEL_CTRL, ord("Q"), self.ID_EXIT),
             ]
         )
@@ -1764,6 +1798,9 @@ class Wav2ChatFrame(wx.Frame):
             return
         if key == wx.WXK_F6:
             self._apply_toolbar_visibility(not self._toolbar_visible)
+            return
+        if key == wx.WXK_F7:
+            self.open_settings()
             return
         event.Skip()
 
@@ -1900,6 +1937,8 @@ class Wav2ChatFrame(wx.Frame):
     def set_language(self, locale: str) -> None:
         set_locale(locale)
         self.settings.ui_lang = locale
+        self.app_settings.ui_lang = locale
+        save_app_settings(self.app_settings)
         self._apply_locale()
 
     def _apply_locale(self) -> None:
@@ -3154,9 +3193,9 @@ class Wav2ChatFrame(wx.Frame):
         if not entry.has_audio:
             return False
 
-        json_path = default_json_path(entry.path)
-        if json_path.is_file():
-            transcript = _try_load_transcript_json(json_path)
+        transcript_path = find_transcript_path(entry.path)
+        if transcript_path is not None:
+            transcript = _try_load_transcript_json(transcript_path)
             if transcript is not None:
                 if entry.transcript != transcript or entry.status != "converted" or entry.json_invalid:
                     entry.transcript = transcript
@@ -3181,9 +3220,9 @@ class Wav2ChatFrame(wx.Frame):
 
     def _append_audio_entry(self, path: Path) -> int:
         entry = FileEntry(path=path, has_audio=True)
-        json_path = default_json_path(path)
-        if json_path.is_file():
-            transcript = _try_load_transcript_json(json_path)
+        transcript_path = find_transcript_path(path)
+        if transcript_path is not None:
+            transcript = _try_load_transcript_json(transcript_path)
             if transcript is not None:
                 entry.transcript = transcript
                 entry.status = "converted"
@@ -3232,7 +3271,7 @@ class Wav2ChatFrame(wx.Frame):
                     return index
                 return None
 
-        if path.suffix.lower() == ".json":
+        if is_transcript_path(path):
             return self._append_json_entry(path)
         if is_supported_audio(path):
             return self._append_audio_entry(path)
@@ -3442,7 +3481,7 @@ class Wav2ChatFrame(wx.Frame):
         dialog = wx.FileDialog(
             self,
             message=t("dialog.open_chat_session"),
-            wildcard=f"{t('filetype.json')}|{JSON_WILDCARD}|{t('filetype.all')}|*.*",
+            wildcard=f"{t('filetype.json')}|{CHATLOG_WILDCARD}|{t('filetype.all')}|*.*",
             style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
         )
         if dialog.ShowModal() != wx.ID_OK:
