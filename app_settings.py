@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-SETTINGS_VERSION = 7
+SETTINGS_VERSION = 8
 LOG_PANEL_DEFAULT_HEIGHT = 120
 DEFAULT_WINDOW_WIDTH = 1180
 DEFAULT_WINDOW_HEIGHT = 680
@@ -34,30 +33,26 @@ def default_documents_dir() -> Path:
 
 
 def wav2chat_bindir() -> Path:
-    candidate = Path(sys.argv[0])
-    if not candidate.is_absolute():
-        candidate = (Path.cwd() / candidate).resolve()
-    else:
-        candidate = candidate.resolve()
-    if candidate.is_file():
-        return candidate.parent
-    return candidate
-
-
-def find_data_dir() -> Path | None:
-    bindir = wav2chat_bindir()
-    prefix = bindir.parent
-    for candidate in (bindir / "data", prefix / "data"):
-        if candidate.is_dir():
-            return candidate
-    return None
+    """Directory containing wav2chat.py (package root when running from source)."""
+    package_dir = Path(__file__).resolve().parent
+    wav2chat_py = package_dir / "wav2chat.py"
+    if wav2chat_py.is_file():
+        return wav2chat_py.parent
+    return package_dir
 
 
 def default_recordings_location() -> Path:
-    data_dir = find_data_dir()
-    if data_dir is not None:
-        return data_dir / "Recordings"
-    return default_documents_dir() / "wav2chat" / "Recordings"
+    bindir = wav2chat_bindir()
+    prefixdir = bindir.parent
+    candidates = (
+        prefixdir / "data" / "Recordings",
+        bindir / "data" / "Recordings",
+        default_documents_dir() / "Recordings",
+    )
+    for candidate in candidates[:2]:
+        if candidate.parent.is_dir():
+            return candidate
+    return candidates[2]
 
 
 @dataclass
@@ -80,6 +75,7 @@ class AppSettings:
     large_tools: bool = False
     show_tool_labels: bool = False
     toolbar_visible: bool = True
+    ui_lang: str | None = None
 
     @property
     def recordings_location(self) -> Path:
@@ -125,6 +121,12 @@ class AppSettings:
         large_tools = bool(data.get("large_tools", False))
         show_tool_labels = bool(data.get("show_tool_labels", False))
         toolbar_visible = bool(data.get("toolbar_visible", True))
+        ui_lang_raw = data.get("ui_lang")
+        ui_lang: str | None = None
+        if ui_lang_raw:
+            candidate = str(ui_lang_raw)
+            if candidate in ("en", "zh", "ja", "ko"):
+                ui_lang = candidate
 
         if "use_default_recordings_location" in data:
             use_default = bool(data.get("use_default_recordings_location", True))
@@ -160,6 +162,7 @@ class AppSettings:
             large_tools=large_tools,
             show_tool_labels=show_tool_labels,
             toolbar_visible=toolbar_visible,
+            ui_lang=ui_lang,
         )
 
 
