@@ -122,6 +122,7 @@ def _create_backend(args: argparse.Namespace) -> FunASRBackend:
     return FunASRBackend(
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
+        refresh_models=getattr(args, "refresh_models", False),
     )
 
 
@@ -250,6 +251,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--gui",
         action="store_true",
         help="Open the desktop GUI",
+    )
+    parser.add_argument(
+        "--refresh-models",
+        action="store_true",
+        help="Re-check ModelScope and reload models (default: load from local cache with mmap)",
     )
     parser.add_argument(
         "--ui-lang",

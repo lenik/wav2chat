@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from wav2chat.audio import normalize_audio
@@ -18,6 +20,36 @@ SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".amr", ".aac", ".flac", ".ogg"}
 
 # phase, file_percent (0-100 within the current file, or None if unknown)
 ProgressCallback = Callable[[str, int | None], None]
+
+_HEARTBEAT_INTERVAL_S = 3.0
+
+
+@contextmanager
+def _transcribe_progress_heartbeat(
+    progress_callback: ProgressCallback,
+    *,
+    start_percent: int = 10,
+) -> Iterator[list[int]]:
+    """Bump transcribing progress while FunASR runs without tqdm updates."""
+    current = [start_percent]
+
+    def pulse() -> None:
+        current[0] = min(94, current[0] + 1)
+        progress_callback("transcribing", current[0])
+
+    stop = threading.Event()
+
+    def run() -> None:
+        while not stop.wait(_HEARTBEAT_INTERVAL_S):
+            pulse()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        yield current
+    finally:
+        stop.set()
+        thread.join(timeout=0.2)
 
 
 def is_supported_audio(path: Path) -> bool:
@@ -63,18 +95,30 @@ def convert_file(
         )
         use_progress_hook = progress_callback is not None
 
-        def on_transcribe_percent(sub_percent: int) -> None:
-            if progress_callback is None:
-                return
-            file_percent = 10 + int(85 * sub_percent / 100)
-            progress_callback("transcribing", file_percent)
+        if progress_callback is not None:
+            progress_callback("transcribing", 10)
+
+        if use_progress_hook:
+            with _transcribe_progress_heartbeat(progress_callback) as heartbeat:
+                def on_transcribe_percent_tracked(sub_percent: int) -> None:
+                    file_percent = 10 + int(85 * sub_percent / 100)
+                    heartbeat[0] = file_percent
+                    progress_callback("transcribing", file_percent)
+
+                return backend.transcribe(
+                    wav_path=normalized_path,
+                    source_name=input_path.name,
+                    roles=roles,
+                    disable_progress=False,
+                    progress_callback=on_transcribe_percent_tracked,
+                )
 
         return backend.transcribe(
             wav_path=normalized_path,
             source_name=input_path.name,
             roles=roles,
-            disable_progress=suppress_progress and not use_progress_hook,
-            progress_callback=on_transcribe_percent if use_progress_hook else None,
+            disable_progress=suppress_progress,
+            progress_callback=None,
         )
     finally:
         if keep_temp and normalized_path is not None and normalized_path.exists():

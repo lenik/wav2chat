@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from wav2chat.errors import FunASREmptyResultError, FunASRLoadError
+from wav2chat.jieba_cache import configure_jieba_cache
 from wav2chat.models import Segment, Transcript, index_string_speaker_segments
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,33 @@ def _is_local_model_dir(path: Path) -> bool:
     return any((path / marker).is_file() for marker in ("model.pt", "config.yaml", "configuration.json"))
 
 
-def _resolve_modelscope_model(model: str) -> str:
+@contextmanager
+def _prefer_mmap_torch_load(enabled: bool = True) -> Iterator[None]:
+    """Use PyTorch mmap when reading checkpoints (faster load from local cache)."""
+    if not enabled:
+        yield
+        return
+
+    import torch
+
+    original_load = torch.load
+
+    def patched_load(f, *args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs.setdefault("mmap", True)
+        return original_load(f, *args, **kwargs)
+
+    torch.load = patched_load  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        torch.load = original_load
+
+
+def _resolve_modelscope_model(model: str, *, refresh: bool = False) -> str:
     """Prefer a local ModelScope cache directory over hub aliases."""
+    if refresh:
+        return model
+
     local = Path(model).expanduser()
     if _is_local_model_dir(local):
         return str(local.resolve())
@@ -277,6 +303,7 @@ class FunASRBackend:
         vad_model: str = DEFAULT_VAD_MODEL,
         punc_model: str = DEFAULT_PUNC_MODEL,
         spk_model: str = DEFAULT_SPK_MODEL,
+        refresh_models: bool = False,
     ) -> None:
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
@@ -284,7 +311,12 @@ class FunASRBackend:
         self.vad_model = vad_model
         self.punc_model = punc_model
         self.spk_model = spk_model
+        self.refresh_models = refresh_models
         self._model: Any | None = None
+
+    def unload(self) -> None:
+        """Drop the loaded model so the next load starts fresh."""
+        self._model = None
 
     def _load_model(self) -> Any:
         if self._model is not None:
@@ -298,30 +330,45 @@ class FunASRBackend:
                 f"Import error: {exc}"
             ) from exc
 
-        spk_kwargs: dict[str, Any] = {"check_latest": False}
+        configure_jieba_cache()
+
+        spk_kwargs: dict[str, Any] = {"check_latest": self.refresh_models}
         if self.min_speakers is not None:
             spk_kwargs["min_speakers"] = self.min_speakers
         if self.max_speakers is not None:
             spk_kwargs["max_speakers"] = self.max_speakers
 
+        resolve = lambda name: _resolve_modelscope_model(name, refresh=self.refresh_models)
+        resolved = {
+            "model": resolve(self.asr_model),
+            "vad_model": resolve(self.vad_model),
+            "punc_model": resolve(self.punc_model),
+            "spk_model": resolve(self.spk_model),
+        }
+
         kwargs: dict[str, Any] = {
-            "model": _resolve_modelscope_model(self.asr_model),
-            "vad_model": _resolve_modelscope_model(self.vad_model),
-            "punc_model": _resolve_modelscope_model(self.punc_model),
-            "spk_model": _resolve_modelscope_model(self.spk_model),
-            "disable_update": True,
-            "check_latest": False,
+            **resolved,
+            "disable_update": not self.refresh_models,
+            "check_latest": self.refresh_models,
             "log_level": "WARNING",
-            "vad_kwargs": {"check_latest": False},
-            "punc_kwargs": {"check_latest": False},
+            "vad_kwargs": {"check_latest": self.refresh_models},
+            "punc_kwargs": {"check_latest": self.refresh_models},
             "spk_kwargs": spk_kwargs,
         }
 
         try:
+            if self.refresh_models:
+                logger.info("Refreshing FunASR models from ModelScope hub")
+            else:
+                logger.info(
+                    "Loading FunASR models from local cache (mmap): %s",
+                    resolved,
+                )
             logger.debug("Loading FunASR models: %s", kwargs)
             load_started = time.perf_counter()
             with _funasr_load_timing_logs():
-                self._model = AutoModel(**kwargs)
+                with _prefer_mmap_torch_load(enabled=not self.refresh_models):
+                    self._model = AutoModel(**kwargs)
             logger.info(
                 "FunASR models loaded in %.1fs",
                 time.perf_counter() - load_started,
@@ -330,6 +377,10 @@ class FunASRBackend:
             raise FunASRLoadError(f"Failed to load FunASR models: {exc}") from exc
 
         return self._model
+
+    def load(self) -> None:
+        """Load FunASR models eagerly (first transcribe otherwise loads lazily)."""
+        self._load_model()
 
     def transcribe(
         self,
@@ -350,6 +401,7 @@ class FunASRBackend:
             progress_ctx = _null_context()
         try:
             with progress_ctx:
+                logger.info("Transcribing %s", source_name)
                 res = model.generate(input=str(wav_path), batch_size_s=300)
         except Exception as exc:
             raise FunASREmptyResultError(f"FunASR transcription failed: {exc}") from exc
