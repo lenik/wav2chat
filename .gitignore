@@ -52,6 +52,7 @@
 *.so
 *.so.*
 *.spec
+!packager/*.spec
 *.substvars
 *.swo
 *.swp
