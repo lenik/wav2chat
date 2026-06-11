@@ -808,7 +808,7 @@ class Wav2ChatFrame(
             )
         self._apply_directory_tree_visibility(
             self.app_settings.directory_tree_visible,
-            from_toggle=False,
+            _from_toggle=False,
         )
         if self._directory_tree_visible and self.app_settings.splitter_browser_pos:
             self._splitter_browser_pos = self.app_settings.splitter_browser_pos
@@ -938,9 +938,8 @@ class Wav2ChatFrame(
         self,
         visible: bool,
         *,
-        from_toggle: bool = True,
+        _from_toggle: bool = True,
     ) -> None:
-        del from_toggle
         if visible == self._directory_tree_visible:
             self._view_menu.Check(self.ID_SHOW_DIRECTORY, visible)
             self._sync_toolbar_toggles()
