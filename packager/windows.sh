@@ -47,6 +47,7 @@ main() {
   packager_windows_check
   packager_prepare
   packager_ensure_wx
+  packager_require_wx
   packager_build
 }
 

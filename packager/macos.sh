@@ -45,6 +45,7 @@ main() {
   packager_macos_check
   packager_prepare
   packager_ensure_wx
+  packager_require_wx
   packager_build
   echo "Optional: codesign the binary for Gatekeeper:"
   echo "  codesign --force --deep --sign - dist/wav2chat"
