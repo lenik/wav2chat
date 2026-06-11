@@ -109,6 +109,7 @@ debian/zephyr/
 debian/files
 depcomp
 dist/
+.packager-venv/
 install-sh
 itree.tex
 libauto

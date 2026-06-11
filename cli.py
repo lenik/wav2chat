@@ -272,9 +272,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _argv_for_parse(argv: list[str] | None) -> list[str]:
+    effective = sys.argv[1:] if argv is None else list(argv)
+    if getattr(sys, "frozen", False) and not effective:
+        return ["--gui"]
+    return effective
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_argv_for_parse(argv))
 
     _configure_logging(args.verbose, args.quiet)
     set_locale(args.ui_lang)
