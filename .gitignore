@@ -111,6 +111,8 @@ debian/files
 depcomp
 dist/
 .packager-venv/
+.packager-wheelhouse/
+.packager-pip-cache/
 install-sh
 itree.tex
 libauto
@@ -132,4 +134,5 @@ target/
 v-store
 
 /data
+/.pyarmor
 
