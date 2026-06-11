@@ -24,15 +24,16 @@ from wav2chat.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
 from wav2chat.errors import FunASREmptyResultError, Wav2ChatError
 from wav2chat.fs_browser import (
     TREE_DUMMY_LABEL,
+    iter_browser_paths,
     list_subdirectories,
     path_breadcrumb_segments,
+    paths_in_directory,
 )
 from wav2chat.filename_meta import entry_timestamp, parse_audio_filename
 from wav2chat.funasr_backend import FunASRBackend
 from wav2chat.i18n import SUPPORTED_LOCALES, set_locale, t
 from wav2chat.models import Segment, Speaker, Transcript
 from wav2chat.pipeline import (
-    CHATLOG_EXTENSION,
     SUPPORTED_EXTENSIONS,
     collect_supported_audio_paths,
     convert_file,
@@ -79,8 +80,11 @@ MIN_TREE_PANEL_WIDTH = 120
 MIN_CHAT_PANEL_WIDTH = 420
 STATUS_PROGRESS_WIDTH = 140
 NAME_COL = 0
-STATUS_COL = 1
+OCCUR_COL = 1
+STATUS_COL = 2
+OCCUR_COL_WIDTH = 52
 STATUS_COL_WIDTH = STATUS_ICON_SIZE + 14
+LOAD_BAR_HEIGHT = 3
 PLAYING_SEGMENT_RGB = (0xBB, 0xDE, 0xFB)
 SEARCH_MATCH_RGB = (255, 249, 196)
 SEARCH_BUBBLE_RGB = (255, 244, 180)
@@ -367,10 +371,26 @@ def _entry_transcript_text(entry: FileEntry) -> str:
 def _entry_matches_keywords(entry: FileEntry, keywords: list[str]) -> bool:
     if not keywords:
         return True
-    if entry.transcript is None:
-        return False
+    return _entry_keyword_occurrence_count(entry, keywords) > 0
+
+
+def _entry_keyword_occurrence_count(entry: FileEntry, keywords: list[str]) -> int:
+    if not keywords or entry.transcript is None:
+        return 0
     haystack = _entry_transcript_text(entry).casefold()
-    return all(keyword.casefold() in haystack for keyword in keywords)
+    total = 0
+    for keyword in keywords:
+        needle = keyword.casefold()
+        if not needle:
+            continue
+        start = 0
+        while True:
+            pos = haystack.find(needle, start)
+            if pos == -1:
+                break
+            total += 1
+            start = pos + len(needle)
+    return total
 
 
 def _segment_matches_keywords(segment: Segment, keywords: list[str]) -> bool:
@@ -434,22 +454,36 @@ def _entry_json_path(entry: FileEntry) -> Path:
 
 
 def _list_directory_paths(directory: Path) -> list[Path]:
-    try:
-        items = sorted(directory.iterdir(), key=lambda p: p.name.lower())
-    except OSError:
-        return []
-    audio_paths = [path for path in items if is_supported_audio(path)]
-    chatlog_paths = [
-        path
-        for path in items
-        if path.is_file() and path.suffix.lower() == CHATLOG_EXTENSION
-    ]
-    audio_stems = {path.stem for path in audio_paths}
-    combined = list(audio_paths)
-    for chatlog_path in chatlog_paths:
-        if chatlog_path.stem not in audio_stems:
-            combined.append(chatlog_path)
-    return sorted(combined, key=lambda p: p.name.lower())
+    return paths_in_directory(directory)
+
+
+class _FileListLoadBar(wx.Panel):
+    """Thin gray/black progress strip at the top of the file list."""
+
+    def __init__(self, parent: wx.Window) -> None:
+        super().__init__(parent, size=(-1, LOAD_BAR_HEIGHT))
+        self._fraction = 0.0
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.Bind(wx.EVT_PAINT, self._on_paint)
+        self.Bind(wx.EVT_SIZE, lambda _event: self.Refresh())
+
+    def set_fraction(self, fraction: float) -> None:
+        self._fraction = max(0.0, min(1.0, fraction))
+        self.Refresh()
+
+    def _on_paint(self, event: wx.PaintEvent) -> None:
+        dc = wx.PaintDC(self)
+        width, height = self.GetClientSize()
+        if width <= 0 or height <= 0:
+            return
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.SetBrush(wx.Brush(wx.Colour(200, 200, 200)))
+        dc.DrawRectangle(0, 0, width, height)
+        fill_width = max(1, int(width * self._fraction)) if self._fraction > 0 else 0
+        if fill_width > 0:
+            dc.SetBrush(wx.Brush(wx.Colour(0, 0, 0)))
+            dc.DrawRectangle(0, 0, fill_width, height)
+        event.Skip()
 
 
 def _transcript_is_empty(transcript: Transcript | None) -> bool:
@@ -687,6 +721,16 @@ class Wav2ChatFrame(wx.Frame):
         self._import_dialog: _ImportDialog | None = None
         self._import_active = False
         self._import_added_indices: list[int] = []
+        self._load_generation = 0
+        self._load_thread: threading.Thread | None = None
+        self._load_in_progress = False
+        self._load_append_mode = False
+        self._load_added_indices: list[int] = []
+        self._search_generation = 0
+        self._search_thread: threading.Thread | None = None
+        self._entry_occur_counts: list[int] = []
+        self._base_sort_indices: list[int] = []
+        self._occur_column_visible = False
         self._phone_import_dialog: PhoneImportDialog | None = None
         self._pending_browser_directory: Path | None = None
         self._stop_convert = threading.Event()
@@ -797,15 +841,34 @@ class Wav2ChatFrame(wx.Frame):
         splitter_main.SetSashGravity(0.0)
 
         tree_sizer = wx.BoxSizer(wx.VERTICAL)
+        self._chk_recursive = wx.CheckBox(self._tree_panel, label=t("label.recursive"))
         self._dir_tree = wx.TreeCtrl(
             self._tree_panel,
             style=wx.TR_DEFAULT_STYLE | wx.TR_LINES_AT_ROOT | wx.BORDER_SUNKEN,
         )
+        tree_sizer.Add(self._chk_recursive, 0, wx.ALL, 4)
         tree_sizer.Add(self._dir_tree, 1, wx.EXPAND)
         self._tree_panel.SetSizer(tree_sizer)
 
         file_sizer = wx.BoxSizer(wx.VERTICAL)
+        files_header = wx.BoxSizer(wx.HORIZONTAL)
         self._label_files = wx.StaticText(self._file_panel, label=t("label.files"))
+        self._label_max_items = wx.StaticText(self._file_panel, label=t("label.max_items"))
+        self._max_items_ctrl = wx.TextCtrl(
+            self._file_panel,
+            value="",
+            size=wx.Size(44, -1),
+            style=wx.TE_CENTRE,
+        )
+        self._label_max_items_unit = wx.StaticText(
+            self._file_panel,
+            label=t("label.max_items_unit"),
+        )
+        files_header.Add(self._label_files, 0, wx.ALIGN_CENTER_VERTICAL)
+        files_header.AddStretchSpacer(1)
+        files_header.Add(self._label_max_items, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        files_header.Add(self._max_items_ctrl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        files_header.Add(self._label_max_items_unit, 0, wx.ALIGN_CENTER_VERTICAL)
         self._search_box = wx.TextCtrl(self._file_panel, style=wx.TE_PROCESS_ENTER)
         try:
             self._search_box.SetHint(t("hint.search"))
@@ -827,11 +890,25 @@ class Wav2ChatFrame(wx.Frame):
             width=200,
         )
         self._file_list.InsertColumn(
+            OCCUR_COL,
+            t("label.file_column_occur"),
+            format=wx.LIST_FORMAT_RIGHT,
+            width=0,
+        )
+        self._file_list.InsertColumn(
             STATUS_COL,
             "",
             format=wx.LIST_FORMAT_CENTRE,
             width=STATUS_COL_WIDTH,
         )
+
+        self._file_list_wrap = wx.Panel(self._file_panel)
+        wrap_sizer = wx.BoxSizer(wx.VERTICAL)
+        self._load_bar = _FileListLoadBar(self._file_list_wrap)
+        self._load_bar.Hide()
+        wrap_sizer.Add(self._load_bar, 0, wx.EXPAND)
+        wrap_sizer.Add(self._file_list, 1, wx.EXPAND)
+        self._file_list_wrap.SetSizer(wrap_sizer)
 
         min_speakers, max_speakers = self._speaker_count_defaults()
         speaker_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -858,9 +935,9 @@ class Wav2ChatFrame(wx.Frame):
         control_row.AddStretchSpacer(1)
         control_row.Add(self._chk_auto_convert, 0, wx.ALIGN_CENTER_VERTICAL)
 
-        file_sizer.Add(self._label_files, 0, wx.BOTTOM, 4)
+        file_sizer.Add(files_header, 0, wx.EXPAND | wx.BOTTOM, 4)
         file_sizer.Add(self._search_box, 0, wx.EXPAND | wx.BOTTOM, 4)
-        file_sizer.Add(self._file_list, 1, wx.EXPAND | wx.BOTTOM, 8)
+        file_sizer.Add(self._file_list_wrap, 1, wx.EXPAND | wx.BOTTOM, 8)
         file_sizer.Add(speaker_row, 0, wx.EXPAND | wx.BOTTOM, 6)
         file_sizer.Add(control_row, 0, wx.EXPAND)
         file_outer = wx.BoxSizer(wx.HORIZONTAL)
@@ -1266,7 +1343,7 @@ class Wav2ChatFrame(wx.Frame):
         menu.Destroy()
 
     def _navigate_from_breadcrumb(self, directory: Path) -> None:
-        if self._converting_active or self._import_active:
+        if self._converting_active:
             return
         try:
             directory = directory.expanduser().resolve()
@@ -1702,8 +1779,58 @@ class Wav2ChatFrame(wx.Frame):
                 self._splitter_file_pos = sash
         event.Skip()
 
+    def _max_items_limit(self) -> int:
+        text = self._max_items_ctrl.GetValue().strip()
+        if not text:
+            return 0
+        try:
+            return max(0, int(text))
+        except ValueError:
+            return 0
+
+    def _effective_load_limit(self, *, for_append: bool) -> int:
+        limit = self._max_items_limit()
+        if limit <= 0:
+            return 0
+        if for_append:
+            return max(0, limit - len(self.entries))
+        return limit
+
+    def _cancel_async_load(self) -> None:
+        self._load_generation += 1
+        self._load_in_progress = False
+        if hasattr(self, "_load_bar"):
+            self._load_bar.Hide()
+            self._file_list_wrap.Layout()
+
+    def _cancel_async_search(self) -> None:
+        self._search_generation += 1
+
+    def _refresh_base_sort(self) -> None:
+        self._base_sort_indices = sorted(
+            range(len(self.entries)),
+            key=lambda index: self.entries[index].path.name.casefold(),
+        )
+
+    def _set_occur_column_visible(self, visible: bool) -> None:
+        self._occur_column_visible = visible
+        width = OCCUR_COL_WIDTH if visible else 0
+        self._file_list.SetColumnWidth(OCCUR_COL, width)
+        self._resize_file_list_columns()
+
+    def _show_load_bar(self, fraction: float) -> None:
+        if not self._load_bar.IsShown():
+            self._load_bar.Show()
+            self._file_list_wrap.Layout()
+        self._load_bar.set_fraction(fraction)
+
+    def _hide_load_bar(self) -> None:
+        if self._load_bar.IsShown():
+            self._load_bar.Hide()
+            self._file_list_wrap.Layout()
+
     def _load_directory_files(self, directory: Path) -> None:
-        if self._converting_active or self._import_active:
+        if self._converting_active:
             return
         try:
             directory = directory.expanduser().resolve()
@@ -1712,24 +1839,251 @@ class Wav2ChatFrame(wx.Frame):
         if not directory.is_dir():
             return
 
+        self._cancel_async_load()
+        self._cancel_async_search()
+
         self._current_directory = directory
         self._set_breadcrumbs(directory)
         self._persist_browser_directory(directory)
         self._search_box.SetValue("")
         self._search_keywords = []
+        self._entry_occur_counts = []
+        self._set_occur_column_visible(False)
         self._selection_explicit_empty = True
         self.entries.clear()
-
-        for path in _list_directory_paths(directory):
-            self._append_entry(path)
-
+        self._base_sort_indices = []
+        self._visible_entry_indices = []
+        self._load_append_mode = False
+        self._load_added_indices = []
         self.focus_index = None
-        self._sync_file_list()
-        self._deselect_all_file_rows()
+
+        if self._file_list.IsShown():
+            self._file_list.DeleteAllItems()
+        else:
+            self._file_list_needs_sync = True
         self._clear_session_view()
+        self._start_async_directory_load(directory)
+
+    def _start_async_directory_load(self, directory: Path) -> None:
+        gen = self._load_generation
+        self._load_in_progress = True
+        self._show_load_bar(0.0)
+        max_items = self._effective_load_limit(for_append=False)
+        recursive = self._chk_recursive.GetValue()
+
+        def worker() -> None:
+            try:
+                paths = iter_browser_paths(
+                    directory,
+                    recursive=recursive,
+                    max_items=max_items,
+                )
+                total = len(paths)
+                for index, path in enumerate(paths, start=1):
+                    if gen != self._load_generation:
+                        return
+                    self._ui_queue.put(("load_item", (gen, path, index, total)))
+                if gen == self._load_generation:
+                    self._ui_queue.put(("load_done", (gen, total)))
+            except Exception as exc:
+                self._ui_queue.put(("load_error", (gen, str(exc))))
+                if gen == self._load_generation:
+                    self._ui_queue.put(("load_done", (gen, 0)))
+
+        self._load_thread = threading.Thread(target=worker, daemon=True)
+        self._load_thread.start()
+
+    def _collect_drop_paths(self, paths: list[Path]) -> list[Path]:
+        collected: list[Path] = []
+        limit = self._effective_load_limit(for_append=True)
+        recursive = self._chk_recursive.GetValue()
+        seen: set[Path] = set()
+
+        def add(path: Path) -> bool:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if resolved in seen:
+                return True
+            seen.add(resolved)
+            collected.append(resolved)
+            if limit > 0 and len(collected) >= limit:
+                return False
+            return True
+
+        for raw in paths:
+            try:
+                path = raw.expanduser().resolve()
+            except OSError:
+                continue
+            if path.is_dir():
+                for child in iter_browser_paths(
+                    path,
+                    recursive=recursive,
+                    max_items=0,
+                ):
+                    if not add(child):
+                        return collected
+            elif is_supported_audio(path) or is_transcript_path(path):
+                if not add(path):
+                    return collected
+        return collected
+
+    def _start_async_drop_load(self, paths: list[Path]) -> None:
+        if self._converting_active:
+            return
+        collected = self._collect_drop_paths(paths)
+        if not collected:
+            return
+
+        self._cancel_async_load()
+        gen = self._load_generation
+        self._load_in_progress = True
+        self._load_append_mode = True
+        self._load_added_indices = []
+        self._show_load_bar(0.0)
+        total = len(collected)
+
+        def worker() -> None:
+            try:
+                for index, path in enumerate(collected, start=1):
+                    if gen != self._load_generation:
+                        return
+                    self._ui_queue.put(("load_item", (gen, path, index, total)))
+                if gen == self._load_generation:
+                    self._ui_queue.put(("load_done", (gen, total)))
+            except Exception as exc:
+                self._ui_queue.put(("load_error", (gen, str(exc))))
+                if gen == self._load_generation:
+                    self._ui_queue.put(("load_done", (gen, 0)))
+
+        self._load_thread = threading.Thread(target=worker, daemon=True)
+        self._load_thread.start()
+
+    def _handle_load_item(self, gen: int, path: Path, index: int, total: int) -> None:
+        if gen != self._load_generation:
+            return
+        limit = self._max_items_limit()
+        if limit > 0 and len(self.entries) >= limit:
+            return
+
+        entry_index = self._append_entry(path)
+        if entry_index is None:
+            if total > 0:
+                self._show_load_bar(index / total)
+            return
+
+        if self._load_append_mode:
+            self._load_added_indices.append(entry_index)
+        self._base_sort_indices.append(entry_index)
+        list_row = self._file_list.GetItemCount()
+        self._visible_entry_indices.append(entry_index)
+        entry = self.entries[entry_index]
+        self._file_list.InsertItem(list_row, _entry_label(entry.path))
+        if self._occur_column_visible:
+            count = (
+                self._entry_occur_counts[entry_index]
+                if entry_index < len(self._entry_occur_counts)
+                else 0
+            )
+            if count:
+                self._file_list.SetItem(list_row, OCCUR_COL, str(count))
+        self._set_file_row_status_image(list_row, entry)
+        self._resize_file_list_columns()
+        if total > 0:
+            self._show_load_bar(index / total)
+
+    def _handle_load_done(self, gen: int, total: int) -> None:
+        if gen != self._load_generation:
+            return
+        self._load_in_progress = False
+        self._show_load_bar(1.0)
+        self._hide_load_bar()
+        self._refresh_base_sort()
+        append_mode = self._load_append_mode
+        added_indices = list(self._load_added_indices)
+        self._load_append_mode = False
+        self._load_added_indices = []
+        if append_mode and added_indices:
+            self._after_paths_added(added_indices)
+            if self._search_keywords:
+                self._start_async_search()
+            return
+        if self._search_keywords:
+            self._sync_file_list()
+            self._start_async_search()
+        elif not self._file_list.IsShown():
+            self._file_list_needs_sync = True
+        else:
+            self._sync_file_list()
+
+    def _start_async_search(self) -> None:
+        self._cancel_async_search()
+        keywords = list(self._search_keywords)
+        if not keywords:
+            return
+
+        gen = self._search_generation
+        entry_count = len(self.entries)
+        self._entry_occur_counts = [0] * entry_count
+
+        def worker() -> None:
+            counts = [0] * entry_count
+            for index, entry in enumerate(self.entries):
+                if gen != self._search_generation:
+                    return
+                counts[index] = _entry_keyword_occurrence_count(entry, keywords)
+                if index % 3 == 2 or index == entry_count - 1:
+                    self._ui_queue.put(
+                        ("search_progress", (gen, list(counts[: index + 1]))),
+                    )
+            if gen == self._search_generation:
+                self._ui_queue.put(("search_done", (gen, counts)))
+
+        self._search_thread = threading.Thread(target=worker, daemon=True)
+        self._search_thread.start()
+
+    def _apply_search_counts(self, counts: list[int], *, resort: bool) -> None:
+        if resort:
+            if len(counts) != len(self.entries):
+                padded = [0] * len(self.entries)
+                for index, value in enumerate(counts):
+                    if index < len(padded):
+                        padded[index] = value
+                counts = padded
+            self._entry_occur_counts = counts
+        else:
+            if len(self._entry_occur_counts) != len(self.entries):
+                self._entry_occur_counts = [0] * len(self.entries)
+            for index, value in enumerate(counts):
+                if index < len(self._entry_occur_counts):
+                    self._entry_occur_counts[index] = value
+        if not self._file_list.IsShown():
+            self._file_list_needs_sync = True
+            return
+        if resort:
+            selected_entries = set(self._selected_entry_indices())
+            preserve_focus = self._search_box.HasFocus()
+            self._sync_file_list(
+                restore_selection=selected_entries,
+                preserve_search_focus=preserve_focus,
+            )
+            return
+        for list_row, entry_index in enumerate(self._visible_entry_indices):
+            count = (
+                self._entry_occur_counts[entry_index]
+                if entry_index < len(self._entry_occur_counts)
+                else 0
+            )
+            self._file_list.SetItem(
+                list_row,
+                OCCUR_COL,
+                str(count) if count else "",
+            )
 
     def refresh_browser(self) -> None:
-        if self._converting_active or self._import_active:
+        if self._converting_active:
             return
         directory = self._current_directory
         if directory is None:
@@ -2075,6 +2429,9 @@ class Wav2ChatFrame(wx.Frame):
             self._lang_menu.SetLabel(item_id, t(f"lang.{code}"))
 
         self._label_files.SetLabel(t("label.files"))
+        self._label_max_items.SetLabel(t("label.max_items"))
+        self._label_max_items_unit.SetLabel(t("label.max_items_unit"))
+        self._chk_recursive.SetLabel(t("label.recursive"))
         try:
             if not self._search_box.HasFocus():
                 self._search_box.SetHint(t("hint.search"))
@@ -2100,6 +2457,10 @@ class Wav2ChatFrame(wx.Frame):
         col = self._file_list.GetColumn(NAME_COL)
         col.SetText(t("label.file_column"))
         self._file_list.SetColumn(NAME_COL, col)
+        occur_col = self._file_list.GetColumn(OCCUR_COL)
+        occur_col.SetText(t("label.file_column_occur"))
+        self._file_list.SetColumn(OCCUR_COL, occur_col)
+        self._set_occur_column_visible(self._occur_column_visible)
         self._set_status(self._status_key, **self._status_kwargs)
 
         if self._phone_import_dialog is not None:
@@ -2136,13 +2497,26 @@ class Wav2ChatFrame(wx.Frame):
         query = self._search_box.GetValue()
         self._search_keywords = _parse_search_keywords(query)
         if not self._search_keywords:
-            self._visible_entry_indices = list(range(len(self.entries)))
-        else:
-            self._visible_entry_indices = [
-                index
-                for index, entry in enumerate(self.entries)
-                if _entry_matches_keywords(entry, self._search_keywords)
-            ]
+            if (
+                self._base_sort_indices
+                and len(self._base_sort_indices) == len(self.entries)
+            ):
+                self._visible_entry_indices = list(self._base_sort_indices)
+            else:
+                self._visible_entry_indices = list(range(len(self.entries)))
+            return
+
+        counts = self._entry_occur_counts
+        if len(counts) != len(self.entries):
+            counts = [0] * len(self.entries)
+
+        self._visible_entry_indices = sorted(
+            range(len(self.entries)),
+            key=lambda index: (
+                -counts[index],
+                self.entries[index].path.name.casefold(),
+            ),
+        )
 
     def _list_row_for_entry(self, entry_index: int) -> int | None:
         try:
@@ -2249,10 +2623,25 @@ class Wav2ChatFrame(wx.Frame):
     def _apply_search_filter(self, *, preserve_search_focus: bool = False) -> None:
         previous_focus = self.focus_index
         selected_entries = set(self._selected_entry_indices())
-        self._sync_file_list(
-            restore_selection=selected_entries,
-            preserve_search_focus=preserve_search_focus,
-        )
+        query = self._search_box.GetValue()
+        self._search_keywords = _parse_search_keywords(query)
+
+        if not self._search_keywords:
+            self._cancel_async_search()
+            self._entry_occur_counts = []
+            self._set_occur_column_visible(False)
+            self._sync_file_list(
+                restore_selection=selected_entries,
+                preserve_search_focus=preserve_search_focus,
+            )
+        else:
+            self._entry_occur_counts = [0] * len(self.entries)
+            self._set_occur_column_visible(True)
+            self._sync_file_list(
+                restore_selection=selected_entries,
+                preserve_search_focus=preserve_search_focus,
+            )
+            self._start_async_search()
 
         if (
             previous_focus is not None
@@ -2833,7 +3222,7 @@ class Wav2ChatFrame(wx.Frame):
         event.Skip()
 
     def _delete_selected_entries(self) -> None:
-        if self._converting_active or self._import_active:
+        if self._converting_active or self._load_in_progress:
             return
         if self._selection_explicit_empty:
             return
@@ -3213,10 +3602,13 @@ class Wav2ChatFrame(wx.Frame):
 
     def _resize_file_list_columns(self) -> None:
         client_size = self._file_list.GetClientSize()
-        if client_size.width <= STATUS_COL_WIDTH:
+        occur_width = OCCUR_COL_WIDTH if self._occur_column_visible else 0
+        fixed_width = occur_width + STATUS_COL_WIDTH
+        if client_size.width <= fixed_width:
             return
-        name_width = client_size.width - STATUS_COL_WIDTH
+        name_width = client_size.width - fixed_width
         self._file_list.SetColumnWidth(NAME_COL, name_width)
+        self._file_list.SetColumnWidth(OCCUR_COL, occur_width)
         self._file_list.SetColumnWidth(STATUS_COL, STATUS_COL_WIDTH)
 
     def _on_file_list_size(self, event: wx.SizeEvent) -> None:
@@ -3244,6 +3636,14 @@ class Wav2ChatFrame(wx.Frame):
             entry = self.entries[entry_index]
             label = _entry_label(entry.path)
             self._file_list.InsertItem(list_row, label)
+            if self._occur_column_visible:
+                count = (
+                    self._entry_occur_counts[entry_index]
+                    if entry_index < len(self._entry_occur_counts)
+                    else 0
+                )
+                if count:
+                    self._file_list.SetItem(list_row, OCCUR_COL, str(count))
 
         self._set_file_list_selection(
             restore_selection,
@@ -3263,11 +3663,21 @@ class Wav2ChatFrame(wx.Frame):
             self._file_list_needs_sync = True
             return
         if self._search_keywords:
-            selected_entries = set(self._selected_entry_indices())
-            self._sync_file_list(
-                restore_selection=selected_entries,
-                preserve_search_focus=self._search_box.HasFocus(),
-            )
+            list_row = self._list_row_for_entry(entry_index)
+            if list_row is not None:
+                entry = self.entries[entry_index]
+                self._set_file_row_status_image(list_row, entry)
+                if self._occur_column_visible:
+                    count = (
+                        self._entry_occur_counts[entry_index]
+                        if entry_index < len(self._entry_occur_counts)
+                        else 0
+                    )
+                    self._file_list.SetItem(
+                        list_row,
+                        OCCUR_COL,
+                        str(count) if count else "",
+                    )
             return
         list_row = self._list_row_for_entry(entry_index)
         if list_row is None:
@@ -3387,6 +3797,7 @@ class Wav2ChatFrame(wx.Frame):
         if not added_indices:
             return
 
+        self._refresh_base_sort()
         self._sync_file_list()
         if self.focus_index is None:
             self.focus_index = added_indices[0]
@@ -3421,17 +3832,11 @@ class Wav2ChatFrame(wx.Frame):
         self._import_dialog.Raise()
 
     def _import_dropped_paths(self, paths: list[Path]) -> None:
-        if self._import_active:
+        if self._converting_active:
             logging.info(t("log.import_busy"))
             self._append_log(logging.INFO, t("log.import_busy"))
             return
-
-        self._import_active = True
-        self._open_import_dialog()
-        logging.info(t("log.import_start"))
-        self._append_log(logging.INFO, t("log.import_start"))
-        self._set_status_text(t("dialog.import_scanning"))
-        wx.CallAfter(self._start_import_drop_worker, list(paths))
+        wx.CallAfter(self._start_async_drop_load, list(paths))
 
     def _start_import_drop_worker(self, paths: list[Path]) -> None:
         if not self._import_active or self._import_dialog is None:
@@ -3547,7 +3952,7 @@ class Wav2ChatFrame(wx.Frame):
         dialog.Destroy()
 
     def import_from_phone(self) -> None:
-        if self._import_active:
+        if self._load_in_progress:
             wx.MessageBox(
                 t("log.import_busy"),
                 t("dialog.import_from_phone"),
@@ -3857,6 +4262,33 @@ class Wav2ChatFrame(wx.Frame):
                     else int(payload_dict["file_percent"])
                 ),
             )
+        elif kind == "load_item":
+            gen, path, index, total = payload  # type: ignore[misc]
+            if gen != self._load_generation:
+                return False
+            self._handle_load_item(
+                int(gen),
+                Path(path),
+                int(index),
+                int(total),
+            )
+        elif kind == "load_done":
+            gen, total = payload  # type: ignore[misc]
+            self._handle_load_done(int(gen), int(total))
+        elif kind == "load_error":
+            gen, message = payload  # type: ignore[misc]
+            if gen == self._load_generation:
+                self._append_log(logging.ERROR, str(message))
+        elif kind == "search_progress":
+            gen, partial_counts = payload  # type: ignore[misc]
+            if gen != self._search_generation:
+                return False
+            self._apply_search_counts(list(partial_counts), resort=False)
+        elif kind == "search_done":
+            gen, counts = payload  # type: ignore[misc]
+            if gen != self._search_generation:
+                return False
+            self._apply_search_counts(list(counts), resort=True)
         elif kind == "import_status":
             message = str(payload)
             if self._import_dialog is not None:
