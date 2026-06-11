@@ -1,0 +1,2 @@
+# PyTorch wheels (e.g. 2.12.0+cpu) require setuptools<82.
+setuptools>=61,<82
