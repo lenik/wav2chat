@@ -43,4 +43,4 @@ jsonfix = "wav2chat.jsonfix:main"
 
 [tool.setuptools]
 package-dir = { wav2chat = "." }
-packages = ["wav2chat"]
+packages = ["wav2chat", "wav2chat.gui", "wav2chat.gui.widgets"]

@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import wx
 
-from wav2chat.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
+from wav2chat.gui.dialog_utils import bind_dialog_escape_close, setup_dialog_fonts
 from wav2chat.i18n import t
 from wav2chat.models import (
     DEFAULT_SPEAKER_AVATARS,
